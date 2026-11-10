@@ -434,6 +434,33 @@ class Database:
             row = self._project_row(conn, project_id)
             return self._project_dict(conn, row)
 
+    def reorder_projects(self, project_ids: Any) -> list[dict[str, Any]]:
+        if not isinstance(project_ids, list):
+            raise ValidationError("Некорректный порядок проектов")
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for value in project_ids:
+            if not isinstance(value, str) or not value:
+                raise ValidationError("Некорректный порядок проектов")
+            if value in seen:
+                raise ValidationError("Проекты в списке повторяются")
+            seen.add(value)
+            ordered.append(value)
+
+        with self.write() as conn:
+            existing = [
+                row["id"] for row in conn.execute("SELECT id FROM projects").fetchall()
+            ]
+            if len(existing) != len(ordered) or set(existing) != seen:
+                raise ValidationError("Нужно передать все проекты в новом порядке")
+            stamp = now_iso()
+            for index, project_id in enumerate(ordered):
+                conn.execute(
+                    "UPDATE projects SET position = ?, updated_at = ? WHERE id = ?",
+                    (index, stamp, project_id),
+                )
+        return self.list_projects()
+
     def _pick_color(self, conn: sqlite3.Connection) -> str:
         used = {
             row["color"]: int(row["n"])

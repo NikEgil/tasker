@@ -107,7 +107,13 @@ def main() -> int:
         check(str(CONFIG) in db["config_path"], "config_path указывает на настройки")
         check(db["default_path"] != str(A), "путь по умолчанию отличается от --db")
         check(
-            info["preferences"] == {"show_project_name": True, "show_completed": True},
+            info["preferences"]
+            == {
+                "show_project_name": True,
+                "show_completed": True,
+                "sort_projects_by_tasks": False,
+                "show_weekends": True,
+            },
             "настройки календаря по умолчанию включены",
         )
 
@@ -122,17 +128,33 @@ def main() -> int:
             port,
             "POST",
             "/api/settings/calendar",
-            {"show_project_name": False, "show_completed": False},
+            {
+                "show_project_name": False,
+                "show_completed": False,
+                "sort_projects_by_tasks": True,
+                "show_weekends": False,
+            },
         )
         check(status == 200, "настройки календаря сохраняются")
         check(
-            saved["preferences"] == {"show_project_name": False, "show_completed": False},
+            saved["preferences"]
+            == {
+                "show_project_name": False,
+                "show_completed": False,
+                "sort_projects_by_tasks": True,
+                "show_weekends": False,
+            },
             "ответ содержит новые настройки",
         )
         stored = json.loads((CONFIG / "settings.json").read_text(encoding="utf-8"))
         check(
             stored.get("calendar")
-            == {"show_project_name": False, "show_completed": False},
+            == {
+                "show_project_name": False,
+                "show_completed": False,
+                "sort_projects_by_tasks": True,
+                "show_weekends": False,
+            },
             "настройки календаря записаны в settings.json",
         )
 
@@ -150,7 +172,12 @@ def main() -> int:
         check(switched["info"]["stats"]["projects"] == 0, "новая база пустая")
         check(
             switched["info"]["preferences"]
-            == {"show_project_name": False, "show_completed": False},
+            == {
+                "show_project_name": False,
+                "show_completed": False,
+                "sort_projects_by_tasks": True,
+                "show_weekends": False,
+            },
             "настройки календаря сохраняются при смене базы",
         )
         stored = json.loads((CONFIG / "settings.json").read_text(encoding="utf-8"))
@@ -197,7 +224,12 @@ def main() -> int:
         )
         check(
             bootstrap["info"]["preferences"]
-            == {"show_project_name": False, "show_completed": False},
+            == {
+                "show_project_name": False,
+                "show_completed": False,
+                "sort_projects_by_tasks": True,
+                "show_weekends": False,
+            },
             "после перезапуска восстанавливаются настройки календаря",
         )
         ids = [project["id"] for project in bootstrap["projects"]]

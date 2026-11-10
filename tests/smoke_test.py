@@ -158,6 +158,29 @@ def main() -> None:
         status, _ = call("POST", "/api/projects", {"name": "   "})
         check(status == 400, "пустое имя проекта отклоняется")
 
+        status, data = call("POST", "/api/projects", {"name": "Второй проект"})
+        second = data["project"]
+        status, data = call("POST", "/api/projects", {"name": "Третий проект"})
+        third = data["project"]
+        order = [third["id"], project_id, second["id"]]
+        status, data = call("POST", "/api/projects/reorder", {"ids": order})
+        check(status == 200, "порядок проектов сохраняется")
+        check(
+            [item["id"] for item in data["projects"]] == order,
+            "проекты возвращаются в новом порядке",
+        )
+        status, _ = call(
+            "POST", "/api/projects/reorder", {"ids": [third["id"], project_id]}
+        )
+        check(status == 400, "неполный порядок проектов отклоняется")
+        for item in (second, third):
+            call("DELETE", f"/api/projects/{item['id']}")
+        status, data = call("GET", "/api/projects")
+        check(
+            len(data["projects"]) == 1 and data["projects"][0]["id"] == project_id,
+            "временные проекты удалены",
+        )
+
         status, data = call("PATCH", f"/api/projects/{project_id}", {"name": "Рабочий проект"})
         check(status == 200 and data["project"]["name"] == "Рабочий проект", "проект переименовывается")
 

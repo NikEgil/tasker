@@ -61,6 +61,11 @@ export const api = {
     }),
   deleteProject: (id) =>
     request(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  reorderProjects: (ids) =>
+    request("/api/projects/reorder", {
+      method: "POST",
+      body: { ids },
+    }),
 
   listTasks: (projectId) =>
     request(`/api/projects/${encodeURIComponent(projectId)}/tasks`),

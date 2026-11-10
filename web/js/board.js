@@ -6,7 +6,6 @@ import {
   formatDateOnly,
   openModal,
   confirmDialog,
-  showMenu,
   toast,
 } from "./ui.js";
 
@@ -55,10 +54,6 @@ export function createBoard({ container, callbacks }) {
             ${icon("check")}
           </button>
           <h3 class="task-title">${esc(task.title)}</h3>
-          <button type="button" class="icon-btn task-menu-btn" data-task-menu="${esc(task.id)}"
-                  title="Действия с задачей" aria-label="Действия с задачей">
-            ${icon("dots")}
-          </button>
         </div>
         ${task.description ? `<p class="task-description">${esc(task.description)}</p>` : ""}
         <footer class="task-card-foot">
@@ -302,49 +297,6 @@ export function createBoard({ container, callbacks }) {
   }
 
   /* -------------------------------------------------------------- */
-  /* меню карточки                                                  */
-  /* -------------------------------------------------------------- */
-  function openTaskMenu(anchor, task) {
-    if (!task) return;
-    const items = [
-      {
-        label: "Редактировать",
-        icon: "edit",
-        action: () => taskModal(task),
-      },
-      { separator: true },
-      ...COLUMNS.map((column) => ({
-        label: `В «${column.title}»`,
-        icon: column.id === task.status ? "check" : undefined,
-        disabled: column.id === task.status,
-        action: () => callbacks.moveTask(task.id, column.id, null),
-      })),
-      { separator: true },
-      {
-        label: "Удалить",
-        icon: "trash",
-        danger: true,
-        action: () => removeTask(task),
-      },
-    ];
-    showMenu(anchor, items);
-  }
-
-  async function removeTask(task) {
-    const confirmed = await confirmDialog({
-      title: "Удалить задачу?",
-      message: `«${task.title}» будет удалена без возможности восстановления.`,
-      confirmLabel: "Удалить",
-    });
-    if (!confirmed) return;
-    try {
-      await callbacks.deleteTask(task.id);
-    } catch (error) {
-      toast(error?.message || "Не удалось удалить задачу", "error");
-    }
-  }
-
-  /* -------------------------------------------------------------- */
   /* быстрый ввод в колонке                                         */
   /* -------------------------------------------------------------- */
   function openComposer(status, { value = null, focus = true, silent = false } = {}) {
@@ -547,13 +499,6 @@ export function createBoard({ container, callbacks }) {
       const task = tasks.find((item) => item.id === checkButton.dataset.checkTask);
       if (task) callbacks.quickToggle(task);
       return;
-    }
-
-    const menuButton = event.target.closest("[data-task-menu]");
-    if (menuButton) {
-      event.stopPropagation();
-      const task = tasks.find((item) => item.id === menuButton.dataset.taskMenu);
-      if (task) openTaskMenu(menuButton, task);
     }
   });
 

@@ -102,10 +102,10 @@ function monthTitle(year, month) {
   return cleanDateText(monthFormatter.format(new Date(year, month, 1, 12)));
 }
 
-function weekTitle(startKey) {
+function weekTitle(startKey, endOffset = 6) {
   const start = dateFromKey(startKey);
   if (!start) return "";
-  const end = addDays(start, 6);
+  const end = addDays(start, endOffset);
   const startMonth = start.getMonth();
   const endMonth = end.getMonth();
   const startYear = start.getFullYear();
@@ -143,6 +143,7 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
 
   let showProjectName = preferences.show_project_name !== false;
   let showCompleted = preferences.show_completed !== false;
+  let showWeekends = preferences.show_weekends !== false;
   root.classList.toggle("hide-project-names", !showProjectName);
 
   const now = new Date();
@@ -234,9 +235,11 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
 
   function renderWeekdays() {
     const today = todayKey();
+    const days = showWeekends ? WEEKDAYS : WEEKDAYS.slice(0, 5);
+    weekdays.classList.toggle("is-no-weekends", !showWeekends);
     if (mode === "week") {
       const start = dateFromKey(weekStartDate) || new Date();
-      weekdays.innerHTML = WEEKDAYS.map((day, index) => {
+      weekdays.innerHTML = days.map((day, index) => {
         const date = addDays(start, index);
         const key = dateKey(date);
         return `<div class="calendar-weekday is-week-date${index >= 5 ? " is-weekend" : ""}${
@@ -247,7 +250,7 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
       }).join("");
       return;
     }
-    weekdays.innerHTML = WEEKDAYS.map(
+    weekdays.innerHTML = days.map(
       (day, index) =>
         `<div class="calendar-weekday${index >= 5 ? " is-weekend" : ""}">${day}</div>`
     ).join("");
@@ -296,8 +299,10 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
 
     const isWeek = mode === "week";
     board.classList.toggle("is-week-view", isWeek);
+    board.classList.toggle("is-no-weekends", !showWeekends);
     board.setAttribute("aria-label", isWeek ? "Неделя" : "Месяц");
     grid.classList.toggle("is-week", isWeek);
+    grid.classList.toggle("is-no-weekends", !showWeekends);
     modeButtons.forEach((button) => {
       const active = button.dataset.calendarMode === mode;
       button.classList.toggle("is-active", active);
@@ -307,7 +312,8 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
     const cells = [];
     if (isWeek) {
       const start = dateFromKey(weekStartDate) || new Date();
-      for (let index = 0; index < 7; index += 1) {
+      const dayCount = showWeekends ? 7 : 5;
+      for (let index = 0; index < dayCount; index += 1) {
         const date = addDays(start, index);
         const key = dateKey(date);
         cells.push(
@@ -317,7 +323,7 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
         );
       }
       grid.innerHTML = cells.join("");
-      const title = weekTitle(weekStartDate);
+      const title = weekTitle(weekStartDate, dayCount - 1);
       monthLabel.textContent = title;
       monthLabel.title = title;
       prevButton.setAttribute("aria-label", "Предыдущая неделя");
@@ -326,8 +332,11 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
       nextButton.setAttribute("title", "Следующая неделя");
     } else {
       const start = startOfGrid(year, month);
-      for (let index = 0; index < GRID_DAYS; index += 1) {
-        const date = addDays(start, index);
+      const rows = showWeekends ? GRID_DAYS : 30;
+      for (let index = 0; index < rows; index += 1) {
+        const date = showWeekends
+          ? addDays(start, index)
+          : addDays(start, Math.floor(index / 5) * 7 + (index % 5));
         const key = dateKey(date);
         cells.push(
           dayCellHTML(
@@ -506,6 +515,9 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
     }
     if ("show_completed" in next) {
       showCompleted = next.show_completed !== false;
+    }
+    if ("show_weekends" in next) {
+      showWeekends = next.show_weekends !== false;
     }
     root.classList.toggle("hide-project-names", !showProjectName);
     renderGrid();

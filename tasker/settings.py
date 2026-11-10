@@ -11,6 +11,8 @@ from typing import Any
 DEFAULT_CALENDAR = {
     "show_project_name": True,
     "show_completed": True,
+    "sort_projects_by_tasks": False,
+    "show_weekends": True,
 }
 
 

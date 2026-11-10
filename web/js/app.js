@@ -50,6 +50,8 @@ const state = {
   preferences: {
     show_project_name: true,
     show_completed: true,
+    sort_projects_by_tasks: false,
+    show_weekends: true,
   },
   loadToken: 0,
   calendarToken: 0,
@@ -90,6 +92,8 @@ let chat = null;
 let calendar = null;
 let mobileChatOpen = false;
 let wasMobile = null;
+let projectDragId = null;
+let projectOrderBusy = false;
 
 const CHAT_WIDTH_KEY = "tasker-chat-width";
 const DEFAULT_CHAT_WIDTH = 388;
@@ -136,9 +140,10 @@ function recomputeActiveCounts() {
 function projectItemHTML(project) {
   const isActive = state.view === "project" && project.id === state.activeId;
   const pending = activeCount(project);
+  const sortable = !state.preferences.sort_projects_by_tasks;
   return `
     <div class="project-item${isActive ? " is-active" : ""}" data-project-id="${esc(project.id)}"
-         role="button" tabindex="0" aria-current="${isActive ? "true" : "false"}"
+         draggable="${sortable}" role="button" tabindex="0" aria-current="${isActive ? "true" : "false"}"
          aria-label="${esc(project.name)}${pending ? `, активных задач: ${pending}` : ""}">
       <span class="project-color" style="--project-color:${esc(project.color)}"></span>
       <span class="project-name" title="${esc(project.name)}">${esc(project.name)}</span>
@@ -148,8 +153,33 @@ function projectItemHTML(project) {
     </div>`;
 }
 
+function projectPosition(project) {
+  return Number.isFinite(project.position) ? project.position : 0;
+}
+
+function orderedProjects() {
+  const projects = [...state.projects];
+  projects.sort(
+    (a, b) =>
+      projectPosition(a) - projectPosition(b) ||
+      String(a.created_at || "").localeCompare(String(b.created_at || ""))
+  );
+  if (state.preferences.sort_projects_by_tasks) {
+    projects.sort(
+      (a, b) =>
+        activeCount(a) - activeCount(b) ||
+        projectPosition(a) - projectPosition(b)
+    );
+  }
+  return projects;
+}
+
 function renderSidebar() {
-  elements.projectList.innerHTML = state.projects.map(projectItemHTML).join("");
+  elements.projectList.classList.toggle(
+    "is-sortable",
+    !state.preferences.sort_projects_by_tasks
+  );
+  elements.projectList.innerHTML = orderedProjects().map(projectItemHTML).join("");
   elements.projectEmpty.hidden = state.projects.length > 0;
   const calendarActive = state.view === "calendar";
   elements.calendarNav.classList.toggle("is-active", calendarActive);
@@ -168,8 +198,33 @@ function applyCalendarPreferences(preferences = {}) {
   state.preferences = {
     show_project_name: preferences.show_project_name !== false,
     show_completed: preferences.show_completed !== false,
+    sort_projects_by_tasks: preferences.sort_projects_by_tasks === true,
+    show_weekends: preferences.show_weekends !== false,
   };
   if (calendar) calendar.setPreferences(state.preferences);
+  renderSidebar();
+}
+
+async function persistProjectOrder(ids) {
+  if (projectOrderBusy) return;
+  projectOrderBusy = true;
+  const previous = state.projects;
+  const positions = new Map(ids.map((id, index) => [id, index]));
+  state.projects = state.projects
+    .map((project) => ({ ...project, position: positions.get(project.id) ?? project.position }))
+    .sort((a, b) => projectPosition(a) - projectPosition(b));
+  renderSidebar();
+  try {
+    const result = await api.reorderProjects(ids);
+    state.projects = result.projects || state.projects;
+    renderSidebar();
+  } catch (error) {
+    state.projects = previous;
+    renderSidebar();
+    toast(error?.message || "Не удалось сохранить порядок проектов", "error");
+  } finally {
+    projectOrderBusy = false;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -891,7 +946,26 @@ function openSettingsModal() {
               <span>Если выключить, завершённые задачи останутся на доске, но исчезнут из календаря.</span>
             </span>
           </label>
+          <label class="settings-check">
+            <input type="checkbox" id="setting-show-weekends"
+                   ${state.preferences.show_weekends ? "checked" : ""}>
+            <span class="settings-check-copy">
+              <strong>Показывать выходные</strong>
+              <span>Суббота и воскресенье в месяце и неделе. Если выключить, останутся только рабочие дни.</span>
+            </span>
+          </label>
           <p class="db-meta settings-hint">Настройки применяются сразу и сохраняются.</p>
+        </div>
+        <div class="settings-projects-section">
+          <div class="db-section-label">Проекты</div>
+          <label class="settings-check">
+            <input type="checkbox" id="setting-sort-projects"
+                   ${state.preferences.sort_projects_by_tasks ? "checked" : ""}>
+            <span class="settings-check-copy">
+              <strong>Автосортировка проектов по возрастанию</strong>
+              <span>По числу активных задач. Выключено — перетаскивайте проекты в списке вручную.</span>
+            </span>
+          </label>
         </div>
         <div class="db-section">
           <div class="db-section-label">Текущая база</div>
@@ -942,7 +1016,7 @@ function openSettingsModal() {
 
       openModal({
         title: "Настройки",
-        subtitle: "Календарь и файл базы данных",
+        subtitle: "Календарь, проекты и файл базы данных",
         className: "modal-db modal-settings",
         body,
         footer,
@@ -952,6 +1026,8 @@ function openSettingsModal() {
           const browseButton = overlay.querySelector('[data-act="browse"]');
           const showProject = overlay.querySelector("#setting-show-project");
           const showCompleted = overlay.querySelector("#setting-show-completed");
+          const showWeekends = overlay.querySelector("#setting-show-weekends");
+          const sortProjects = overlay.querySelector("#setting-sort-projects");
           let busy = false;
           let savingPreferences = false;
 
@@ -961,10 +1037,14 @@ function openSettingsModal() {
             const next = {
               show_project_name: showProject.checked,
               show_completed: showCompleted.checked,
+              sort_projects_by_tasks: sortProjects.checked,
+              show_weekends: showWeekends.checked,
             };
+            const checkboxes = [showProject, showCompleted, showWeekends, sortProjects];
             savingPreferences = true;
-            showProject.disabled = true;
-            showCompleted.disabled = true;
+            checkboxes.forEach((checkbox) => {
+              checkbox.disabled = true;
+            });
             applyCalendarPreferences(next);
             try {
               const result = await api.saveCalendarSettings(next);
@@ -973,20 +1053,27 @@ function openSettingsModal() {
               applyCalendarPreferences(saved);
               showProject.checked = state.preferences.show_project_name;
               showCompleted.checked = state.preferences.show_completed;
+              showWeekends.checked = state.preferences.show_weekends;
+              sortProjects.checked = state.preferences.sort_projects_by_tasks;
             } catch (error) {
               applyCalendarPreferences(previous);
               showProject.checked = previous.show_project_name;
               showCompleted.checked = previous.show_completed;
+              showWeekends.checked = previous.show_weekends;
+              sortProjects.checked = previous.sort_projects_by_tasks;
               toast(error?.message || "Не удалось сохранить настройки", "error");
             } finally {
               savingPreferences = false;
-              showProject.disabled = false;
-              showCompleted.disabled = false;
+              checkboxes.forEach((checkbox) => {
+                checkbox.disabled = false;
+              });
             }
           };
 
           showProject.addEventListener("change", savePreferences);
           showCompleted.addEventListener("change", savePreferences);
+          showWeekends.addEventListener("change", savePreferences);
+          sortProjects.addEventListener("change", savePreferences);
 
           const setBusy = (value) => {
             busy = value;
@@ -1193,7 +1280,7 @@ function openProjectSettings(projectId) {
           toast("Проект удалён", "success");
           if (wasActive) {
             if (state.projects.length) {
-              await selectProject(state.projects[0].id, { history: "replace" });
+              await selectProject(orderedProjects()[0].id, { history: "replace" });
             } else {
               showWelcome();
             }
@@ -1328,6 +1415,73 @@ function bindEvents() {
     openProjectSettings(item.dataset.projectId);
   });
 
+  const clearProjectDropHints = (keepDragging = false) => {
+    elements.projectList
+      .querySelectorAll(".is-drop-before, .is-drop-after")
+      .forEach((item) => item.classList.remove("is-drop-before", "is-drop-after"));
+    if (!keepDragging) {
+      elements.projectList
+        .querySelectorAll(".is-dragging")
+        .forEach((item) => item.classList.remove("is-dragging"));
+    }
+  };
+
+  elements.projectList.addEventListener("dragstart", (event) => {
+    if (state.preferences.sort_projects_by_tasks) {
+      event.preventDefault();
+      return;
+    }
+    const item = event.target.closest("[data-project-id]");
+    if (!item) return;
+    projectDragId = item.dataset.projectId;
+    item.classList.add("is-dragging");
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", projectDragId);
+  });
+
+  elements.projectList.addEventListener("dragover", (event) => {
+    if (!projectDragId || state.preferences.sort_projects_by_tasks) return;
+    const item = event.target.closest("[data-project-id]");
+    if (!item) return;
+    if (item.dataset.projectId === projectDragId) {
+      clearProjectDropHints(true);
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const rect = item.getBoundingClientRect();
+    const after = event.clientY > rect.top + rect.height / 2;
+    elements.projectList
+      .querySelectorAll(".is-drop-before, .is-drop-after")
+      .forEach((row) => row.classList.remove("is-drop-before", "is-drop-after"));
+    item.classList.add(after ? "is-drop-after" : "is-drop-before");
+  });
+
+  elements.projectList.addEventListener("drop", (event) => {
+    if (!projectDragId || state.preferences.sort_projects_by_tasks) return;
+    const target = event.target.closest("[data-project-id]");
+    if (!target || target.dataset.projectId === projectDragId) return;
+    event.preventDefault();
+    const after = target.classList.contains("is-drop-after");
+    const ids = orderedProjects().map((project) => project.id);
+    const from = ids.indexOf(projectDragId);
+    const targetId = target.dataset.projectId;
+    let targetIndex = ids.indexOf(targetId);
+    if (from === -1 || targetIndex === -1) return;
+    ids.splice(from, 1);
+    if (from < targetIndex) targetIndex -= 1;
+    if (after) targetIndex += 1;
+    ids.splice(targetIndex, 0, projectDragId);
+    projectDragId = null;
+    clearProjectDropHints();
+    persistProjectOrder(ids);
+  });
+
+  elements.projectList.addEventListener("dragend", () => {
+    projectDragId = null;
+    clearProjectDropHints();
+  });
+
   elements.projectMenuBtn.addEventListener("click", () => {
     if (state.activeId) openProjectSettings(state.activeId);
   });
@@ -1411,7 +1565,7 @@ function bindEvents() {
     if (id) {
       selectProject(id, { history: "none" });
     } else if (state.projects.length) {
-      selectProject(state.projects[0].id, { history: "replace" });
+      selectProject(orderedProjects()[0].id, { history: "replace" });
     } else {
       showWelcome();
     }
@@ -1518,8 +1672,9 @@ async function init() {
     }
 
     const wanted = parseProjectHash();
+    const ordered = orderedProjects();
     const initial =
-      state.projects.find((project) => project.id === wanted) || state.projects[0];
+      ordered.find((project) => project.id === wanted) || ordered[0];
     if (initial) {
       await selectProject(initial.id, {
         history: wanted === initial.id ? "none" : "replace",

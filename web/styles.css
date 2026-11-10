@@ -372,6 +372,38 @@ select:focus-visible {
   background: var(--surface-3);
 }
 
+.project-list.is-sortable .project-item {
+  cursor: grab;
+}
+
+.project-list.is-sortable .project-item:active {
+  cursor: grabbing;
+}
+
+.project-item.is-dragging {
+  opacity: 0.35;
+}
+
+.project-item.is-drop-before::before,
+.project-item.is-drop-after::after {
+  content: "";
+  position: absolute;
+  right: 7px;
+  left: 7px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.project-item.is-drop-before::before {
+  top: -3px;
+}
+
+.project-item.is-drop-after::after {
+  bottom: -3px;
+}
+
 .project-item.is-active {
   background: var(--surface);
   border-color: var(--border);
@@ -980,24 +1012,6 @@ select:focus-visible {
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
-}
-
-.task-menu-btn {
-  width: 22px;
-  height: 22px;
-  margin: -2px -3px 0 0;
-  color: var(--faint);
-  opacity: 0;
-}
-
-.task-menu-btn .icon {
-  width: 15px;
-  height: 15px;
-}
-
-.task-card:hover .task-menu-btn,
-.task-menu-btn:focus-visible {
-  opacity: 1;
 }
 
 .task-card-foot {
@@ -2456,6 +2470,27 @@ body.is-resizing-chat * {
   border-bottom: 0;
 }
 
+.calendar-weekdays.is-no-weekends,
+.calendar-grid.is-no-weekends {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.calendar-grid.is-no-weekends .calendar-day:nth-child(7n) {
+  border-right: 1px solid var(--border);
+}
+
+.calendar-grid.is-no-weekends .calendar-day:nth-child(5n) {
+  border-right: 0;
+}
+
+.calendar-grid.is-no-weekends .calendar-day:nth-last-child(-n + 7) {
+  border-bottom: 1px solid var(--border);
+}
+
+.calendar-grid.is-no-weekends .calendar-day:nth-last-child(-n + 5) {
+  border-bottom: 0;
+}
+
 .calendar-day.is-weekend {
   background: var(--surface-2);
 }
@@ -3053,7 +3088,8 @@ legend.field-label {
   width: min(620px, 100%);
 }
 
-.settings-calendar-section {
+.settings-calendar-section,
+.settings-projects-section {
   margin-bottom: 18px;
   padding-bottom: 16px;
   border-bottom: 1px solid var(--border);
@@ -3953,7 +3989,6 @@ legend.field-label {
 }
 
 @media (hover: none) {
-  .task-menu-btn,
   .message-actions,
   .project-more,
   .calendar-task-remove {

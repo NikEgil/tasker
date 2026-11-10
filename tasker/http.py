@@ -29,7 +29,7 @@ from .db import (
 from .filedialog import choose_database_path
 from .lifecycle import BrowserLifecycle
 
-VERSION = "1.5.0"
+VERSION = "1.7.0"
 
 MAX_JSON_BODY = 2 * 1024 * 1024
 MAX_UPLOAD_BODY = 120 * 1024 * 1024
@@ -276,6 +276,11 @@ class TaskerHandler(BaseHTTPRequestHandler):
                     data.get("name"), data.get("color")
                 )
                 return self.send_json(201, {"project": project})
+
+        if segments == ["api", "projects", "reorder"] and method == "POST":
+            data = self._read_json()
+            projects = self.server.db.reorder_projects(data.get("ids"))
+            return self.send_json(200, {"projects": projects})
 
         if len(segments) == 3 and segments[:2] == ["api", "projects"]:
             project_id = self._valid_id(segments[2])
