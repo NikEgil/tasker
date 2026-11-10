@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 *.db
 data/
+build/
+dist/
+*.spec
 .pytest_cache/
 .DS_Store
 Thumbs.db

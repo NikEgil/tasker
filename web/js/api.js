@@ -64,6 +64,10 @@ export const api = {
 
   listTasks: (projectId) =>
     request(`/api/projects/${encodeURIComponent(projectId)}/tasks`),
+  calendar: (start, end) => {
+    const params = new URLSearchParams({ start, end });
+    return request(`/api/calendar?${params}`);
+  },
   createTask: (projectId, data) =>
     request(`/api/projects/${encodeURIComponent(projectId)}/tasks`, {
       method: "POST",
@@ -109,6 +113,19 @@ export const api = {
   createBackup: () => request("/api/backup", { method: "POST" }),
   openDataFolder: () =>
     request("/api/open-data-folder", { method: "POST" }),
+  browseDb: () => request("/api/db/browse", { method: "POST", body: {} }),
+  switchDb: (path) =>
+    request("/api/db/switch", { method: "POST", body: { path } }),
+  sessionOpen: (sessionId) =>
+    request("/api/session/open", {
+      method: "POST",
+      body: { session_id: sessionId },
+    }),
+  saveCalendarSettings: (preferences) =>
+    request("/api/settings/calendar", {
+      method: "POST",
+      body: preferences,
+    }),
 
   attachmentUrl: (id, download = false) =>
     `/api/attachments/${encodeURIComponent(id)}${download ? "?download=1" : ""}`,

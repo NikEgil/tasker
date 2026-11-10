@@ -11,20 +11,25 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import traceback
-from datetime import datetime
+from datetime import date, datetime
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from . import settings as app_settings
 from .db import (
     Database,
     NotFoundError,
     ValidationError,
 )
+from .filedialog import choose_database_path
+from .lifecycle import BrowserLifecycle
 
-VERSION = "1.0.0"
+VERSION = "1.5.0"
 
 MAX_JSON_BODY = 2 * 1024 * 1024
 MAX_UPLOAD_BODY = 120 * 1024 * 1024
@@ -69,6 +74,7 @@ INLINE_MIME_TYPES = {
 }
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class ApiError(Exception):
@@ -94,11 +100,57 @@ class TaskerServer(ThreadingHTTPServer):
         db: Database,
         web_dir: str | os.PathLike[str],
         verbose: bool = False,
+        app_dir: str | os.PathLike[str] | None = None,
+        default_db_path: str | os.PathLike[str] | None = None,
+        settings_path: str | os.PathLike[str] | None = None,
+        auto_shutdown: bool = False,
     ):
         self.db = db
         self.web_dir = Path(web_dir).resolve()
         self.verbose = verbose
+        self.app_dir = Path(app_dir).resolve() if app_dir else db.path.parent
+        self.default_db_path = (
+            Path(default_db_path).resolve() if default_db_path else db.path
+        )
+        self.settings_path = (
+            Path(settings_path).resolve()
+            if settings_path
+            else app_settings.settings_path()
+        )
+        self.preferences_lock = threading.Lock()
+        stored_settings = app_settings.load(self.settings_path)
+        self.calendar_preferences = app_settings.normalize_calendar(
+            stored_settings.get("calendar")
+        )
+        self.dialog_lock = threading.Lock()
+        self.auto_shutdown = auto_shutdown
         super().__init__(address, TaskerHandler)
+        self.lifecycle = BrowserLifecycle(
+            self._shutdown_from_browser, enabled=auto_shutdown
+        )
+
+    def _shutdown_from_browser(self) -> None:
+        print("Вкладка закрыта — завершаю Tasker.")
+        try:
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        self.shutdown()
+
+    def server_close(self) -> None:
+        lifecycle = getattr(self, "lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.stop()
+        super().server_close()
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(
+            exc,
+            (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError),
+        ):
+            return
+        super().handle_error(request, client_address)
 
 
 class TaskerHandler(BaseHTTPRequestHandler):
@@ -159,13 +211,43 @@ class TaskerHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "projects": self.server.db.list_projects(),
-                    "info": self.server.db.info(),
+                    "info": self._info_payload(),
                     "version": VERSION,
                 },
             )
 
         if segments == ["api", "info"] and method in ("GET", "HEAD"):
-            return self.send_json(200, self.server.db.info())
+            return self.send_json(200, self._info_payload())
+
+        if segments == ["api", "session", "open"] and method == "POST":
+            return self._open_session()
+
+        if segments == ["api", "session", "close"] and method == "POST":
+            return self._close_session(query)
+
+        if segments == ["api", "session", "events"] and method == "GET":
+            return self._stream_session(query)
+
+        if segments == ["api", "settings", "calendar"] and method == "POST":
+            return self._save_calendar_settings()
+
+        if segments == ["api", "db", "browse"] and method == "POST":
+            return self._browse_database()
+
+        if segments == ["api", "db", "switch"] and method == "POST":
+            return self._switch_database()
+
+        if segments == ["api", "calendar"] and method in ("GET", "HEAD"):
+            start = self._date_param(query.get("start", [""])[0], "start")
+            end = self._date_param(query.get("end", [""])[0], "end")
+            if start > end:
+                raise ApiError(400, "Начало диапазона позже конца")
+            if (end - start).days > 62:
+                raise ApiError(400, "Слишком большой диапазон дат")
+            return self.send_json(
+                200,
+                self.server.db.list_calendar(start.isoformat(), end.isoformat()),
+            )
 
         if segments == ["api", "backup"] and method == "POST":
             path = self.server.db.create_backup()
@@ -235,6 +317,7 @@ class TaskerHandler(BaseHTTPRequestHandler):
                         data.get("title"),
                         data.get("description", ""),
                         data.get("status", "urgent"),
+                        data.get("scheduled_date"),
                     )
                     return self.send_json(201, result)
             if resource == "messages":
@@ -253,7 +336,7 @@ class TaskerHandler(BaseHTTPRequestHandler):
             if method == "PATCH":
                 data = self._read_json()
                 kwargs = {}
-                for key in ("title", "description", "status"):
+                for key in ("title", "description", "status", "scheduled_date"):
                     if key in data:
                         kwargs[key] = data[key]
                 if not kwargs:
@@ -301,6 +384,145 @@ class TaskerHandler(BaseHTTPRequestHandler):
             return self._send_attachment(self._valid_id(segments[2]), query)
 
         raise ApiError(404, "Не найдено")
+
+    def _info_payload(self) -> dict:
+        info = self.server.db.info()
+        info["db"]["default_path"] = str(self.server.default_db_path)
+        info["db"]["config_path"] = str(self.server.settings_path)
+        with self.server.preferences_lock:
+            info["preferences"] = dict(self.server.calendar_preferences)
+        return info
+
+    @staticmethod
+    def _session_id(raw: object) -> str:
+        value = raw.strip() if isinstance(raw, str) else ""
+        if not SESSION_RE.fullmatch(value):
+            raise ApiError(400, "Некорректный идентификатор вкладки")
+        return value
+
+    def _open_session(self) -> None:
+        data = self._read_json()
+        session_id = self._session_id(data.get("session_id"))
+        self.server.lifecycle.open(session_id)
+        return self.send_json(
+            200, {"ok": True, "auto_shutdown": self.server.auto_shutdown}
+        )
+
+    def _close_session(self, query: dict) -> None:
+        raw = query.get("session_id", [""])[0]
+        session_id = self._session_id(raw)
+        self.server.lifecycle.close(session_id)
+        return self.send_json(200, {"ok": True})
+
+    def _sse_chunk(self, data: bytes) -> None:
+        self.wfile.write(f"{len(data):X}\r\n".encode("ascii") + data + b"\r\n")
+        self.wfile.flush()
+
+    def _stream_session(self, query: dict) -> None:
+        raw = query.get("session_id", [""])[0]
+        session_id = self._session_id(raw)
+        lifecycle = self.server.lifecycle
+        lifecycle.open(session_id)
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._sse_chunk(b": connected\n\n")
+            while not lifecycle.stopping:
+                time.sleep(2)
+                self._sse_chunk(b": ping\n\n")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            lifecycle.close(session_id)
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    def _save_calendar_settings(self) -> None:
+        data = self._read_json()
+        with self.server.preferences_lock:
+            preferences = dict(self.server.calendar_preferences)
+        for key in app_settings.DEFAULT_CALENDAR:
+            if key not in data:
+                continue
+            if not isinstance(data[key], bool):
+                raise ApiError(400, f"Настройка {key} должна быть логической")
+            preferences[key] = data[key]
+        try:
+            stored = app_settings.load(self.server.settings_path)
+            stored["calendar"] = preferences
+            app_settings.save(stored, self.server.settings_path)
+        except OSError as exc:
+            raise ApiError(
+                500, f"Не удалось сохранить настройки: {exc}"
+            ) from exc
+        with self.server.preferences_lock:
+            self.server.calendar_preferences = dict(preferences)
+        return self.send_json(200, {"preferences": preferences})
+
+    def _browse_database(self) -> None:
+        try:
+            with self.server.dialog_lock:
+                selected = choose_database_path(str(self.server.db.path))
+        except OSError as exc:
+            raise ApiError(501, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(500, f"Не удалось открыть диалог: {exc}") from exc
+        if not selected:
+            return self.send_json(200, {"cancelled": True})
+        path = Path(selected).expanduser()
+        if not path.is_absolute():
+            path = self.server.app_dir / path
+        return self.send_json(
+            200, {"cancelled": False, "path": str(path.resolve())}
+        )
+
+    def _switch_database(self) -> None:
+        data = self._read_json()
+        raw_path = data.get("path")
+        if raw_path is None or (isinstance(raw_path, str) and not raw_path.strip()):
+            target = self.server.default_db_path
+        else:
+            if not isinstance(raw_path, str):
+                raise ApiError(400, "Некорректный путь к базе")
+            target = Path(os.path.expandvars(raw_path.strip())).expanduser()
+            if not target.is_absolute():
+                target = self.server.app_dir / target
+            target = target.resolve()
+        try:
+            self.server.db.switch_path(target)
+        except ValidationError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(400, f"Не удалось открыть базу: {exc}") from exc
+
+        warning = None
+        try:
+            stored = app_settings.load(self.server.settings_path)
+            if target == self.server.default_db_path:
+                stored.pop("db_path", None)
+            else:
+                stored["db_path"] = str(self.server.db.path)
+            app_settings.save(stored, self.server.settings_path)
+        except OSError as exc:
+            warning = f"База открыта, но путь не сохранился в настройках: {exc}"
+
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "path": str(self.server.db.path),
+                "info": self._info_payload(),
+                "warning": warning,
+            },
+        )
 
     # ------------------------------------------------------------------
     # API: заметки
@@ -524,6 +746,15 @@ class TaskerHandler(BaseHTTPRequestHandler):
             raise ApiError(404, "Не найдено")
         return value
 
+    @staticmethod
+    def _date_param(value: str, name: str) -> date:
+        if not value:
+            raise ApiError(400, f"Не указан параметр {name}")
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise ApiError(400, "Некорректная дата в запросе") from None
+
     def _content_length(self, limit: int) -> int:
         raw = self.headers.get("Content-Length")
         if raw is None:
@@ -589,5 +820,18 @@ def create_server(
     db: Database,
     web_dir: str | os.PathLike[str],
     verbose: bool = False,
+    app_dir: str | os.PathLike[str] | None = None,
+    default_db_path: str | os.PathLike[str] | None = None,
+    settings_path: str | os.PathLike[str] | None = None,
+    auto_shutdown: bool = False,
 ) -> TaskerServer:
-    return TaskerServer((host, port), db, web_dir, verbose)
+    return TaskerServer(
+        (host, port),
+        db,
+        web_dir,
+        verbose,
+        app_dir=app_dir,
+        default_db_path=default_db_path,
+        settings_path=settings_path,
+        auto_shutdown=auto_shutdown,
+    )

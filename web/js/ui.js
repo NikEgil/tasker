@@ -33,6 +33,15 @@ const fullDateTimeFormatter = new Intl.DateTimeFormat("ru-RU", {
   hour: "2-digit",
   minute: "2-digit",
 });
+const shortDateOnlyFormatter = new Intl.DateTimeFormat("ru-RU", {
+  day: "numeric",
+  month: "short",
+});
+const fullDateOnlyFormatter = new Intl.DateTimeFormat("ru-RU", {
+  day: "numeric",
+  month: "long",
+  year: "numeric",
+});
 
 function asDate(iso) {
   if (!iso) return null;
@@ -80,6 +89,16 @@ export function formatDayLabel(iso) {
 export function formatFullDate(iso) {
   const date = asDate(iso);
   return date ? fullDateTimeFormatter.format(date) : "";
+}
+
+export function formatDateOnly(value, style = "short") {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return "";
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12);
+  if (Number.isNaN(date.getTime())) return "";
+  return style === "full"
+    ? fullDateOnlyFormatter.format(date)
+    : shortDateOnlyFormatter.format(date);
 }
 
 export function formatCardDate(iso) {

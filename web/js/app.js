@@ -12,6 +12,20 @@ import {
 } from "./ui.js";
 import { createBoard } from "./board.js";
 import { createChat } from "./chat.js";
+import { openTaskEditor } from "./task-editor.js";
+import {
+  createCalendar,
+  calendarRange,
+  monthParam,
+  parseMonthParam,
+  addDaysKey,
+  dateFromKey,
+  dateKey,
+  todayKey,
+  weekStartKey,
+  weekRange,
+} from "./calendar.js";
+import { startBrowserLifecycle } from "./lifecycle.js";
 
 const PROJECT_COLORS = [
   "#4c6ef5",
@@ -25,6 +39,7 @@ const PROJECT_COLORS = [
 ];
 
 const state = {
+  view: "project",
   projects: [],
   activeId: null,
   activeProject: null,
@@ -32,7 +47,13 @@ const state = {
   messages: [],
   hasMore: false,
   info: null,
+  preferences: {
+    show_project_name: true,
+    show_completed: true,
+  },
   loadToken: 0,
+  calendarToken: 0,
+  calendar: null,
 };
 
 const elements = {
@@ -40,11 +61,13 @@ const elements = {
   sidebar: document.querySelector(".sidebar"),
   projectList: document.getElementById("project-list"),
   projectEmpty: document.getElementById("project-empty"),
+  calendarNav: document.getElementById("calendar-nav"),
+  calendarView: document.getElementById("calendar-view"),
   newProjectBtn: document.getElementById("new-project-btn"),
   newProjectForm: document.getElementById("new-project-form"),
   newProjectName: document.getElementById("new-project-name"),
-  dbPill: document.getElementById("db-pill"),
-  dbSize: document.getElementById("db-size"),
+  dbPill: document.getElementById("settings-pill"),
+  dbSize: document.getElementById("settings-subtitle"),
   themeBtn: document.getElementById("theme-btn"),
   welcome: document.getElementById("welcome"),
   welcomeCreate: document.getElementById("welcome-create"),
@@ -57,14 +80,22 @@ const elements = {
   chatToggleBtn: document.getElementById("chat-toggle-btn"),
   chatCloseBtn: document.getElementById("chat-close-btn"),
   chatPanel: document.getElementById("chat-panel"),
+  chatResizer: document.getElementById("chat-resizer"),
   chatBackdrop: document.getElementById("chat-backdrop"),
   board: document.getElementById("board"),
 };
 
 let board = null;
 let chat = null;
+let calendar = null;
 let mobileChatOpen = false;
 let wasMobile = null;
+
+const CHAT_WIDTH_KEY = "tasker-chat-width";
+const DEFAULT_CHAT_WIDTH = 388;
+const MIN_CHAT_WIDTH = 300;
+let chatWidth = DEFAULT_CHAT_WIDTH;
+let resizingChat = false;
 
 /* ------------------------------------------------------------------ */
 /* проекты и состояние                                                */
@@ -103,7 +134,7 @@ function recomputeActiveCounts() {
 /* сайдбар                                                            */
 /* ------------------------------------------------------------------ */
 function projectItemHTML(project) {
-  const isActive = project.id === state.activeId;
+  const isActive = state.view === "project" && project.id === state.activeId;
   const pending = activeCount(project);
   return `
     <div class="project-item${isActive ? " is-active" : ""}" data-project-id="${esc(project.id)}"
@@ -120,13 +151,25 @@ function projectItemHTML(project) {
 function renderSidebar() {
   elements.projectList.innerHTML = state.projects.map(projectItemHTML).join("");
   elements.projectEmpty.hidden = state.projects.length > 0;
+  const calendarActive = state.view === "calendar";
+  elements.calendarNav.classList.toggle("is-active", calendarActive);
+  elements.calendarNav.setAttribute("aria-current", calendarActive ? "page" : "false");
 }
 
-function renderDbSize() {
+function renderSettingsSubtitle() {
   if (!elements.dbSize) return;
   const size = state.info?.db?.size;
-  elements.dbSize.textContent = size == null ? "—" : formatSize(size);
-  if (state.info?.db?.path) elements.dbPill.title = state.info.db.path;
+  elements.dbSize.textContent =
+    size == null ? "Календарь и база данных" : `Календарь · база ${formatSize(size)}`;
+  elements.dbPill.title = "Настройки";
+}
+
+function applyCalendarPreferences(preferences = {}) {
+  state.preferences = {
+    show_project_name: preferences.show_project_name !== false,
+    show_completed: preferences.show_completed !== false,
+  };
+  if (calendar) calendar.setPreferences(state.preferences);
 }
 
 /* ------------------------------------------------------------------ */
@@ -156,21 +199,40 @@ function renderProjectHeader() {
 /* видимость                                                          */
 /* ------------------------------------------------------------------ */
 function showWelcome() {
+  state.view = "welcome";
   state.activeId = null;
   state.activeProject = null;
+  state.calendarToken += 1;
   elements.projectView.hidden = true;
+  elements.calendarView.hidden = true;
   elements.welcome.hidden = false;
   elements.chatBackdrop.hidden = true;
   document.title = "Tasker — проекты, задачи и заметки";
   if (location.hash) {
     window.history.replaceState({}, "", location.pathname + location.search);
   }
+  renderSidebar();
 }
 
 function showProject() {
+  state.view = "project";
   elements.welcome.hidden = true;
+  elements.calendarView.hidden = true;
   elements.projectView.hidden = false;
   applyChatVisibility();
+}
+
+function showCalendar() {
+  state.view = "calendar";
+  state.activeId = null;
+  state.activeProject = null;
+  state.calendarToken += 1;
+  elements.welcome.hidden = true;
+  elements.projectView.hidden = true;
+  elements.calendarView.hidden = false;
+  elements.chatBackdrop.hidden = true;
+  document.title = "Календарь — Tasker";
+  renderSidebar();
 }
 
 function isMobileView() {
@@ -227,6 +289,55 @@ function toggleChat() {
 }
 
 /* ------------------------------------------------------------------ */
+/* ширина панели заметок                                              */
+/* ------------------------------------------------------------------ */
+function maxChatWidth() {
+  const sidebarWidth = elements.sidebar?.getBoundingClientRect().width || 264;
+  return Math.max(MIN_CHAT_WIDTH, window.innerWidth - sidebarWidth - 470);
+}
+
+function applyChatWidth(width, { persist = false } = {}) {
+  const max = maxChatWidth();
+  const value = Math.round(Math.min(Math.max(Number(width) || DEFAULT_CHAT_WIDTH, MIN_CHAT_WIDTH), max));
+  chatWidth = value;
+  elements.projectView.style.setProperty("--chat-width", `${value}px`);
+  elements.chatResizer.setAttribute("aria-valuenow", String(value));
+  elements.chatResizer.setAttribute("aria-valuemax", String(Math.round(max)));
+  if (persist) {
+    try {
+      localStorage.setItem(CHAT_WIDTH_KEY, String(value));
+    } catch (error) {
+      /* ignore */
+    }
+  }
+  return value;
+}
+
+function initChatWidth() {
+  let stored = 0;
+  try {
+    stored = Number(localStorage.getItem(CHAT_WIDTH_KEY));
+  } catch (error) {
+    stored = 0;
+  }
+  applyChatWidth(stored > 0 ? stored : DEFAULT_CHAT_WIDTH);
+}
+
+function finishChatResize(event) {
+  if (!resizingChat) return;
+  resizingChat = false;
+  document.body.classList.remove("is-resizing-chat");
+  applyChatWidth(chatWidth, { persist: true });
+  if (event && event.pointerId != null && elements.chatResizer.hasPointerCapture?.(event.pointerId)) {
+    try {
+      elements.chatResizer.releasePointerCapture(event.pointerId);
+    } catch (error) {
+      /* ignore */
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* выбор проекта                                                      */
 /* ------------------------------------------------------------------ */
 function projectHash(id) {
@@ -238,11 +349,283 @@ function parseProjectHash() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+function calendarHash(period) {
+  if (period.mode === "week") {
+    return `#calendar/week/${period.weekStart}`;
+  }
+  return `#calendar/${monthParam(period.year, period.month)}`;
+}
+
+function parseCalendarHash() {
+  if (location.hash === "#calendar" || location.hash === "#calendar/") {
+    const now = new Date();
+    return { mode: "month", year: now.getFullYear(), month: now.getMonth() };
+  }
+  const monthMatch = /^#calendar\/(\d{4}-\d{2})$/.exec(location.hash);
+  if (monthMatch) {
+    const parsed = parseMonthParam(monthMatch[1]);
+    return parsed ? { mode: "month", ...parsed } : null;
+  }
+  const weekMatch = /^#calendar\/week(?:\/(\d{4}-\d{2}-\d{2}))?$/.exec(location.hash);
+  if (weekMatch) {
+    const start = weekStartKey(weekMatch[1] || todayKey());
+    return start ? { mode: "week", weekStart: start } : null;
+  }
+  return null;
+}
+
+function normalizeCalendarPeriod(period) {
+  if (period?.mode === "week") {
+    const start = weekStartKey(period.weekStart || todayKey());
+    if (!start) return null;
+    const date = dateFromKey(start);
+    return {
+      mode: "week",
+      weekStart: start,
+      year: date.getFullYear(),
+      month: date.getMonth(),
+    };
+  }
+  const now = new Date();
+  const date = new Date(
+    period?.year ?? now.getFullYear(),
+    period?.month ?? now.getMonth(),
+    1,
+    12
+  );
+  return { mode: "month", year: date.getFullYear(), month: date.getMonth() };
+}
+
+function currentCalendarPeriod() {
+  const current = state.calendar;
+  if (!current) return null;
+  return current.mode === "week"
+    ? { mode: "week", weekStart: current.weekStart }
+    : { mode: "month", year: current.year, month: current.month };
+}
+
+async function openCalendar(period, { history = "push" } = {}) {
+  const target = normalizeCalendarPeriod(period);
+  if (!target) return;
+
+  showCalendar();
+  state.loadToken += 1;
+  state.calendar = { ...target, scheduled: [], unscheduled: [] };
+  const token = ++state.calendarToken;
+  calendar.renderLoading(target);
+
+  const hash = calendarHash(target);
+  if (history === "push") {
+    window.history.pushState({ view: "calendar" }, "", hash);
+  } else if (history === "replace") {
+    window.history.replaceState({ view: "calendar" }, "", hash);
+  }
+
+  try {
+    const range =
+      target.mode === "week"
+        ? weekRange(target.weekStart)
+        : calendarRange(target.year, target.month);
+    if (!range.start || !range.end) {
+      throw new Error("Не удалось определить диапазон дат");
+    }
+    const response = await api.calendar(range.start, range.end);
+    if (token !== state.calendarToken || state.view !== "calendar") return;
+    state.calendar = {
+      ...target,
+      start: response.start,
+      end: response.end,
+      scheduled: response.scheduled || [],
+      unscheduled: response.unscheduled || [],
+    };
+    calendar.render(state.calendar);
+  } catch (error) {
+    if (token !== state.calendarToken) return;
+    toast(error?.message || "Не удалось загрузить календарь", "error");
+    calendar.render(
+      { ...target, scheduled: [], unscheduled: [] },
+      { loading: false }
+    );
+  }
+}
+
+function changeCalendarMode(nextMode) {
+  const current = state.calendar;
+  if (!current || current.mode === nextMode) return;
+  if (nextMode === "week") {
+    let anchor = todayKey();
+    if (current.mode === "month") {
+      const now = new Date();
+      if (current.year !== now.getFullYear() || current.month !== now.getMonth()) {
+        anchor = dateKey(new Date(current.year, current.month, 1, 12));
+      }
+    }
+    const start = weekStartKey(anchor);
+    if (start) {
+      openCalendar({ mode: "week", weekStart: start }, { history: "push" });
+    }
+    return;
+  }
+  const date = dateFromKey(current.weekStart || weekStartKey(todayKey()));
+  if (!date) return;
+  openCalendar(
+    { mode: "month", year: date.getFullYear(), month: date.getMonth() },
+    { history: "push" }
+  );
+}
+
+function navigateCalendar(delta) {
+  const current = state.calendar;
+  if (!current) return;
+  if (current.mode === "week") {
+    const start = addDaysKey(current.weekStart, delta * 7);
+    if (start) {
+      openCalendar({ mode: "week", weekStart: start }, { history: "replace" });
+    }
+    return;
+  }
+  const date = new Date(current.year, current.month + delta, 1, 12);
+  openCalendar(
+    { mode: "month", year: date.getFullYear(), month: date.getMonth() },
+    { history: "replace" }
+  );
+}
+
+function goCalendarToday() {
+  const now = new Date();
+  if (state.calendar?.mode === "week") {
+    openCalendar(
+      { mode: "week", weekStart: weekStartKey(todayKey()) },
+      { history: "replace" }
+    );
+  } else {
+    openCalendar(
+      { mode: "month", year: now.getFullYear(), month: now.getMonth() },
+      { history: "replace" }
+    );
+  }
+}
+
+function findCalendarTask(taskId) {
+  if (!state.calendar) return null;
+  return (
+    [...state.calendar.scheduled, ...state.calendar.unscheduled].find(
+      (task) => task.id === taskId
+    ) || null
+  );
+}
+
+function sortCalendarTasks(tasks) {
+  const statusOrder = { urgent: 0, later: 1, done: 2 };
+  return [...tasks].sort(
+    (a, b) =>
+      String(a.scheduled_date || "").localeCompare(String(b.scheduled_date || "")) ||
+      (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9) ||
+      (a.position ?? 0) - (b.position ?? 0)
+  );
+}
+
+async function scheduleCalendarTask(taskId, date) {
+  if (state.view !== "calendar" || !state.calendar) return;
+  const task = findCalendarTask(taskId);
+  if (!task) return;
+  const nextDate = date || null;
+  if ((task.scheduled_date || null) === nextDate) return;
+
+  const previous = state.calendar;
+  const moved = { ...task, scheduled_date: nextDate };
+  let scheduled = previous.scheduled.filter((item) => item.id !== taskId);
+  let unscheduled = previous.unscheduled.filter((item) => item.id !== taskId);
+  if (nextDate) {
+    scheduled = sortCalendarTasks([...scheduled, moved]);
+  } else {
+    unscheduled = [...unscheduled, moved];
+  }
+  state.calendar = { ...previous, scheduled, unscheduled };
+  calendar.render(state.calendar);
+
+  try {
+    await api.updateTask(taskId, { scheduled_date: nextDate });
+  } catch (error) {
+    toast(error?.message || "Не удалось изменить дату задачи", "error");
+    if (state.view === "calendar" && state.calendar) {
+      await refreshCalendarIfVisible();
+    }
+  }
+}
+
+let lastCalendarProjectId = null;
+
+function refreshCalendarIfVisible() {
+  const period = currentCalendarPeriod();
+  if (state.view === "calendar" && period) {
+    return openCalendar(period, { history: "none" });
+  }
+  return Promise.resolve();
+}
+
+function openCalendarTaskEditor(taskId = null, date = null) {
+  const task = taskId ? findCalendarTask(taskId) : null;
+  if (taskId && !task) {
+    toast("Задача не найдена — обновите календарь", "error");
+    return;
+  }
+  if (!task && !state.projects.length) {
+    toast("Сначала создайте проект", "info");
+    openNewProjectForm();
+    return;
+  }
+  if (task?.project_id) lastCalendarProjectId = task.project_id;
+  const defaultProjectId =
+    task?.project_id || lastCalendarProjectId || state.projects[0]?.id || null;
+
+  openTaskEditor({
+    task,
+    projects: state.projects,
+    defaultDate: date,
+    defaultProjectId,
+    onSave: async (payload) => {
+      if (task) {
+        const response = await api.updateTask(task.id, {
+          title: payload.title,
+          description: payload.description,
+          status: payload.status,
+          scheduled_date: payload.scheduled_date,
+        });
+        setProject(response.project);
+        lastCalendarProjectId = task.project_id;
+      } else {
+        const response = await api.createTask(payload.projectId, {
+          title: payload.title,
+          description: payload.description,
+          status: payload.status,
+          scheduled_date: payload.scheduled_date,
+        });
+        setProject(response.project);
+        lastCalendarProjectId = payload.projectId;
+      }
+      renderSidebar();
+      refreshInfo();
+      await refreshCalendarIfVisible();
+    },
+    onDelete: async () => {
+      if (!task) return;
+      const response = await api.deleteTask(task.id);
+      setProject(response.project);
+      renderSidebar();
+      refreshInfo();
+      await refreshCalendarIfVisible();
+    },
+  });
+}
+
 async function selectProject(id, { history = "push" } = {}) {
   const project = getProject(id);
   if (!project) return;
   if (state.activeId === id && !elements.projectView.hidden) return;
 
+  state.view = "project";
+  state.calendarToken += 1;
   state.activeId = id;
   state.activeProject = project;
   state.tasks = [];
@@ -364,12 +747,13 @@ async function reloadTasks(projectId = state.activeId) {
   }
 }
 
-async function saveTask({ id, title, description, status }) {
+async function saveTask({ id, title, description, status, scheduled_date }) {
   const projectId = state.activeId;
   if (!projectId) throw new Error("Проект не выбран");
+  const payload = { title, description, status, scheduled_date: scheduled_date || null };
   const response = id
-    ? await api.updateTask(id, { title, description, status })
-    : await api.createTask(projectId, { title, description, status });
+    ? await api.updateTask(id, payload)
+    : await api.createTask(projectId, payload);
   if (state.activeId !== projectId) return;
   if (id) replaceTask(response.task);
   else state.tasks.push(response.task);
@@ -450,7 +834,7 @@ async function deleteMessage(id) {
 async function refreshInfo() {
   try {
     state.info = await api.info();
-    renderDbSize();
+    renderSettingsSubtitle();
   } catch (error) {
     /* размер не критичен */
   }
@@ -466,27 +850,83 @@ function downloadBackup() {
   toast("Файл базы выгружается — сохраните его в надёжном месте", "info");
 }
 
-function openDbModal() {
+function openSettingsModal() {
   api
     .info()
     .then((info) => {
       state.info = info;
-      renderDbSize();
+      renderSettingsSubtitle();
+      const db = info.db || {};
       const stats = info.stats || {};
+      const preferences = info.preferences || state.preferences;
+      applyCalendarPreferences(preferences);
+      const savedAt = db.last_write_at || db.modified_at;
+      const writable = Boolean(db.writable);
+      const statusTitle = writable
+        ? db.exists
+          ? "Все изменения сохранены на диск"
+          : "Новый файл будет создан"
+        : "Файл защищён от записи";
+      const statusText = writable
+        ? db.exists
+          ? `Запись включена · последнее сохранение: ${savedAt ? esc(formatFullDate(savedAt)) : "—"}`
+          : "Файл появится после первого сохранения"
+        : "Выберите другой файл или разрешите запись в папку";
       const body = `
+        <div class="settings-calendar-section">
+          <div class="db-section-label">Календарь</div>
+          <label class="settings-check">
+            <input type="checkbox" id="setting-show-project"
+                   ${state.preferences.show_project_name ? "checked" : ""}>
+            <span class="settings-check-copy">
+              <strong>Показывать название проекта</strong>
+              <span>Подпись проекта на карточках в календаре и общем списке.</span>
+            </span>
+          </label>
+          <label class="settings-check">
+            <input type="checkbox" id="setting-show-completed"
+                   ${state.preferences.show_completed ? "checked" : ""}>
+            <span class="settings-check-copy">
+              <strong>Показывать выполненные задачи</strong>
+              <span>Если выключить, завершённые задачи останутся на доске, но исчезнут из календаря.</span>
+            </span>
+          </label>
+          <p class="db-meta settings-hint">Настройки применяются сразу и сохраняются.</p>
+        </div>
         <div class="db-section">
-          <div class="db-section-label">Файл базы</div>
+          <div class="db-section-label">Текущая база</div>
           <div class="db-path-row">
-            <code class="db-path">${esc(info.db.path)}</code>
+            <code class="db-path">${esc(db.path || "")}</code>
             <button type="button" class="icon-btn" data-copy-path title="Скопировать путь" aria-label="Скопировать путь">${icon("copy")}</button>
           </div>
-          <p class="db-meta">${formatSize(info.db.size)} · изменён ${esc(formatFullDate(info.db.modified_at))}</p>
+          <div class="db-status ${writable ? "is-ok" : "is-error"}">
+            <span class="db-status-dot"></span>
+            <div class="db-status-copy">
+              <strong>${statusTitle}</strong>
+              <span>${statusText}</span>
+            </div>
+          </div>
+          <p class="db-meta">${formatSize(db.size || 0)} · изменён ${esc(formatFullDate(db.modified_at))}</p>
         </div>
         <div class="db-stats">
           <div class="db-stat"><span class="db-stat-value">${stats.projects ?? 0}</span><span class="db-stat-label">${plural(stats.projects ?? 0, "проект", "проекта", "проектов")}</span></div>
           <div class="db-stat"><span class="db-stat-value">${stats.tasks ?? 0}</span><span class="db-stat-label">${plural(stats.tasks ?? 0, "задача", "задачи", "задач")}</span></div>
           <div class="db-stat"><span class="db-stat-value">${stats.messages ?? 0}</span><span class="db-stat-label">${plural(stats.messages ?? 0, "заметка", "заметки", "заметок")}</span></div>
           <div class="db-stat"><span class="db-stat-value">${stats.attachments ?? 0}</span><span class="db-stat-label">${plural(stats.attachments ?? 0, "файл", "файла", "файлов")}</span></div>
+        </div>
+        <div class="db-switch">
+          <div class="db-section-label">Выбрать другой файл базы</div>
+          <div class="db-path-input-row">
+            <input class="input" id="db-new-path" type="text" spellcheck="false"
+                   value="${esc(db.path || "")}" aria-label="Путь к файлу базы">
+            <button type="button" class="btn btn-ghost" data-act="browse">Обзор…</button>
+          </div>
+          <div class="db-path-actions">
+            <span class="db-hint">Если файла нет, он будет создан. Текущая база останется на диске.</span>
+            <button type="button" class="btn btn-quiet btn-sm" data-act="default">По умолчанию</button>
+            <button type="button" class="btn btn-primary btn-sm" data-act="apply">Применить</button>
+          </div>
+          <p class="db-meta db-config">Путь запоминается в <code>${esc(db.config_path || "")}</code></p>
         </div>
         <div class="db-note">
           ${icon("database")}
@@ -501,14 +941,91 @@ function openDbModal() {
         <button type="button" class="btn btn-primary" data-act="download">${icon("download")}<span>Скачать БД</span></button>`;
 
       openModal({
-        title: "Данные Tasker",
-        subtitle: "Один файл SQLite — вся информация приложения",
-        className: "modal-db",
+        title: "Настройки",
+        subtitle: "Календарь и файл базы данных",
+        className: "modal-db modal-settings",
         body,
         footer,
         onMount({ overlay, close }) {
+          const pathInput = overlay.querySelector("#db-new-path");
+          const applyButton = overlay.querySelector('[data-act="apply"]');
+          const browseButton = overlay.querySelector('[data-act="browse"]');
+          const showProject = overlay.querySelector("#setting-show-project");
+          const showCompleted = overlay.querySelector("#setting-show-completed");
+          let busy = false;
+          let savingPreferences = false;
+
+          const savePreferences = async () => {
+            if (savingPreferences) return;
+            const previous = { ...state.preferences };
+            const next = {
+              show_project_name: showProject.checked,
+              show_completed: showCompleted.checked,
+            };
+            savingPreferences = true;
+            showProject.disabled = true;
+            showCompleted.disabled = true;
+            applyCalendarPreferences(next);
+            try {
+              const result = await api.saveCalendarSettings(next);
+              const saved = result.preferences || next;
+              state.info = { ...state.info, preferences: saved };
+              applyCalendarPreferences(saved);
+              showProject.checked = state.preferences.show_project_name;
+              showCompleted.checked = state.preferences.show_completed;
+            } catch (error) {
+              applyCalendarPreferences(previous);
+              showProject.checked = previous.show_project_name;
+              showCompleted.checked = previous.show_completed;
+              toast(error?.message || "Не удалось сохранить настройки", "error");
+            } finally {
+              savingPreferences = false;
+              showProject.disabled = false;
+              showCompleted.disabled = false;
+            }
+          };
+
+          showProject.addEventListener("change", savePreferences);
+          showCompleted.addEventListener("change", savePreferences);
+
+          const setBusy = (value) => {
+            busy = value;
+            applyButton.disabled = value;
+            browseButton.disabled = value;
+            applyButton.textContent = value ? "Переключаюсь…" : "Применить";
+          };
+
+          const applyPath = async () => {
+            if (busy) return;
+            const path = pathInput.value.trim();
+            if (!path) {
+              toast("Укажите путь к файлу базы", "error");
+              pathInput.focus();
+              return;
+            }
+            setBusy(true);
+            try {
+              const result = await api.switchDb(path);
+              try {
+                sessionStorage.setItem(
+                  "tasker-flash-success",
+                  `База открыта: ${result.path}`
+                );
+                if (result.warning) {
+                  sessionStorage.setItem("tasker-flash-warning", result.warning);
+                }
+              } catch (error) {
+                /* ignore */
+              }
+              window.location.assign("/");
+            } catch (error) {
+              toast(error?.message || "Не удалось открыть базу", "error");
+              setBusy(false);
+            }
+          };
+
           overlay.querySelector("[data-copy-path]").addEventListener("click", () => {
-            copyText(info.db.path);
+            copyText(db.path);
           });
           overlay.querySelector('[data-act="folder"]').addEventListener("click", async () => {
             try {
@@ -530,6 +1047,37 @@ function openDbModal() {
           overlay.querySelector('[data-act="download"]').addEventListener("click", () => {
             downloadBackup();
             close();
+          });
+          overlay.querySelector('[data-act="default"]').addEventListener("click", () => {
+            pathInput.value = db.default_path || "";
+            pathInput.focus();
+          });
+          browseButton.addEventListener("click", async () => {
+            if (busy) return;
+            browseButton.disabled = true;
+            try {
+              const result = await api.browseDb();
+              if (!result.cancelled) {
+                pathInput.value = result.path;
+                pathInput.focus();
+              }
+            } catch (error) {
+              toast(
+                error?.message ||
+                  "Не удалось открыть системный диалог — введите путь вручную",
+                "error"
+              );
+              pathInput.focus();
+            } finally {
+              browseButton.disabled = false;
+            }
+          });
+          applyButton.addEventListener("click", applyPath);
+          pathInput.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              applyPath();
+            }
           });
         },
       });
@@ -615,6 +1163,7 @@ function openProjectSettings(projectId) {
           setProject(response.project);
           refreshChrome();
           close();
+          refreshCalendarIfVisible();
         } catch (error) {
           toast(error?.message || "Не удалось сохранить проект", "error");
           busy = false;
@@ -648,6 +1197,8 @@ function openProjectSettings(projectId) {
             } else {
               showWelcome();
             }
+          } else {
+            refreshCalendarIfVisible();
           }
         } catch (error) {
           toast(error?.message || "Не удалось удалить проект", "error");
@@ -785,6 +1336,11 @@ function bindEvents() {
   });
   elements.addTaskBtn.addEventListener("click", () => board.openNewTask("urgent"));
 
+  elements.calendarNav.addEventListener("click", () => {
+    const now = new Date();
+    openCalendar({ mode: "month", year: now.getFullYear(), month: now.getMonth() });
+  });
+
   elements.chatToggleBtn.addEventListener("click", toggleChat);
   elements.chatCloseBtn.addEventListener("click", toggleChat);
   elements.chatBackdrop.addEventListener("click", () => {
@@ -793,14 +1349,64 @@ function bindEvents() {
     elements.chatToggleBtn.focus();
   });
 
+  elements.chatResizer.addEventListener("pointerdown", (event) => {
+    if (isMobileView() || event.button !== 0) return;
+    resizingChat = true;
+    document.body.classList.add("is-resizing-chat");
+    elements.chatResizer.focus({ preventScroll: true });
+    try {
+      elements.chatResizer.setPointerCapture(event.pointerId);
+    } catch (error) {
+      /* ignore */
+    }
+    event.preventDefault();
+  });
+
+  elements.chatResizer.addEventListener("pointermove", (event) => {
+    if (!resizingChat) return;
+    const right = elements.projectView.getBoundingClientRect().right;
+    const halfHandle = elements.chatResizer.offsetWidth / 2;
+    chatWidth = applyChatWidth(right - event.clientX - halfHandle);
+  });
+
+  elements.chatResizer.addEventListener("pointerup", finishChatResize);
+  elements.chatResizer.addEventListener("pointercancel", finishChatResize);
+  window.addEventListener("pointerup", finishChatResize);
+  window.addEventListener("pointercancel", finishChatResize);
+
+  elements.chatResizer.addEventListener("keydown", (event) => {
+    if (isMobileView()) return;
+    let delta = 0;
+    if (event.key === "ArrowLeft") delta = 24;
+    else if (event.key === "ArrowRight") delta = -24;
+    else if (event.key === "Home") {
+      event.preventDefault();
+      applyChatWidth(DEFAULT_CHAT_WIDTH, { persist: true });
+      return;
+    }
+    if (!delta) return;
+    event.preventDefault();
+    applyChatWidth(chatWidth + delta, { persist: true });
+  });
+
+  elements.chatResizer.addEventListener("dblclick", () => {
+    if (isMobileView()) return;
+    applyChatWidth(DEFAULT_CHAT_WIDTH, { persist: true });
+  });
+
   elements.themeBtn.addEventListener("click", toggleTheme);
-  elements.dbPill.addEventListener("click", openDbModal);
+  elements.dbPill.addEventListener("click", openSettingsModal);
 
   document.getElementById("brand").addEventListener("click", (event) => {
     event.preventDefault();
   });
 
   window.addEventListener("popstate", () => {
+    const calendarTarget = parseCalendarHash();
+    if (calendarTarget) {
+      openCalendar(calendarTarget, { history: "none" });
+      return;
+    }
     const id = parseProjectHash();
     if (id) {
       selectProject(id, { history: "none" });
@@ -817,6 +1423,9 @@ function bindEvents() {
       wasMobile = mobile;
       mobileChatOpen = false;
       applyChatVisibility();
+    }
+    if (!mobile) {
+      applyChatWidth(chatWidth);
     }
   });
 
@@ -835,8 +1444,22 @@ function bindEvents() {
 /* ------------------------------------------------------------------ */
 /* старт                                                             */
 /* ------------------------------------------------------------------ */
+function showPendingFlash() {
+  try {
+    const success = sessionStorage.getItem("tasker-flash-success");
+    const warning = sessionStorage.getItem("tasker-flash-warning");
+    sessionStorage.removeItem("tasker-flash-success");
+    sessionStorage.removeItem("tasker-flash-warning");
+    if (success) toast(success, "success");
+    if (warning) toast(warning, "error");
+  } catch (error) {
+    /* ignore */
+  }
+}
+
 async function init() {
   bindEvents();
+  startBrowserLifecycle();
   wasMobile = isMobileView();
 
   board = createBoard({
@@ -863,14 +1486,36 @@ async function init() {
     },
   });
 
+  calendar = createCalendar({
+    root: elements.calendarView,
+    preferences: state.preferences,
+    callbacks: {
+      onNavigate: navigateCalendar,
+      onToday: goCalendarToday,
+      onModeChange: changeCalendarMode,
+      onSchedule: scheduleCalendarTask,
+      onEditTask: (taskId) => openCalendarTaskEditor(taskId),
+      onCreateTask: (date) => openCalendarTaskEditor(null, date),
+    },
+  });
+
+  initChatWidth();
   applyChatVisibility();
 
   try {
     const bootstrap = await api.bootstrap();
     state.projects = bootstrap.projects || [];
     state.info = bootstrap.info || null;
+    applyCalendarPreferences(state.info?.preferences || state.preferences);
     renderSidebar();
-    renderDbSize();
+    renderSettingsSubtitle();
+    showPendingFlash();
+
+    const wantedCalendar = parseCalendarHash();
+    if (wantedCalendar) {
+      await openCalendar(wantedCalendar, { history: "replace" });
+      return;
+    }
 
     const wanted = parseProjectHash();
     const initial =

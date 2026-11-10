@@ -10,13 +10,14 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 STATUSES = ("urgent", "later", "done")
 STATUS_LABELS = {"urgent": "Срочно", "later": "Потом", "done": "Сделано"}
@@ -75,7 +76,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     position    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
-    done_at     TEXT
+    done_at     TEXT,
+    scheduled_date TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -169,6 +171,23 @@ def _clean_color(value: Any) -> str:
     return value.lower()
 
 
+def _clean_scheduled_date(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError("Некорректная дата задачи")
+    value = value.strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValidationError("Некорректная дата задачи")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValidationError("Некорректная дата задачи") from None
+    return value
+
+
 def clean_filename(value: Any) -> str:
     name = str(value or "").replace("\\", "/").split("/")[-1]
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip().strip(".")
@@ -178,61 +197,188 @@ def clean_filename(value: Any) -> str:
 
 
 class Database:
-    """Небольшая обёртка над SQLite: одно соединение на операцию."""
+    """SQLite-база Tasker с одним долгоживущим соединением.
+
+    Соединение открывается на время работы приложения и закрывается при
+    штатном завершении. Все операции сериализуются внутренним RLock, а
+    каждая запись подтверждается через COMMIT с synchronous=FULL — поэтому
+    перезапуск или аварийное закрытие не теряет уже сохранённые данные
+    (незавершённая транзакция откатывается самим SQLite).
+    """
 
     def __init__(self, path: str | os.PathLike[str]):
-        self.path = Path(path).expanduser().resolve()
-        self.data_dir = self.path.parent
+        self._lock = threading.RLock()
+        self._conn: sqlite3.Connection | None = None
+        self._revision = 0
+        self._last_write_at: str | None = None
+        target = Path(path).expanduser().resolve()
+        self.inspect_path(target)
+        conn = self._open_connection(target)
+        try:
+            self._init_schema(conn)
+        except BaseException:
+            conn.close()
+            raise
+        self.path = target
+        self.data_dir = target.parent
         self.backup_dir = self.data_dir / "backups"
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self._conn = conn
 
     # ------------------------------------------------------------------
-    # соединения и схема
+    # соединение и схема
     # ------------------------------------------------------------------
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), timeout=20)
+    @staticmethod
+    def _open_connection(path: Path) -> sqlite3.Connection:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(
+            str(path),
+            timeout=20,
+            check_same_thread=False,
+            isolation_level=None,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 20000")
+        # DELETE-journal оставляет после завершения транзакции только
+        # один файл .db — это важно для синхронизации.
+        conn.execute("PRAGMA journal_mode = DELETE")
+        conn.execute("PRAGMA synchronous = FULL")
         return conn
 
-    def _init_schema(self) -> None:
-        conn = self.connect()
-        try:
-            # DELETE-journal оставляет после завершения транзакции только
-            # один файл .db — это важно для синхронизации.
-            conn.execute("PRAGMA journal_mode = DELETE")
-            conn.execute("PRAGMA synchronous = FULL")
-            conn.executescript(_SCHEMA)
-            conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    @staticmethod
+    def _init_schema(conn: sqlite3.Connection) -> None:
+        conn.executescript(_SCHEMA)
+
+        # Мягкая миграция: старые базы получают новые поля без перезаписи.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "scheduled_date" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN scheduled_date TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_scheduled ON tasks(scheduled_date)"
+        )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+        conn.commit()
+
+    def _connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise DatabaseError("База данных закрыта")
+        return self._conn
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
-        conn = self.connect()
-        try:
-            yield conn
-        finally:
-            conn.close()
+        with self._lock:
+            yield self._connection()
 
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
-        conn = self.connect()
-        try:
+        with self._lock:
+            conn = self._connection()
             conn.execute("BEGIN IMMEDIATE")
-            yield conn
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+            try:
+                yield conn
+                conn.commit()
+                self._revision += 1
+                self._last_write_at = now_iso()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def close(self) -> None:
+        """Закрыть соединение (идемпотентно)."""
+        with self._lock:
+            conn = self._conn
+            self._conn = None
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+    # ------------------------------------------------------------------
+    # проверка и переключение файла базы
+    # ------------------------------------------------------------------
+    @staticmethod
+    def inspect_path(path: str | os.PathLike[str]) -> dict[str, Any]:
+        """Проверить, что по пути лежит либо новый, либо Tasker-файл."""
+        target = Path(path).expanduser().resolve()
+        if target.exists() and target.is_dir():
+            raise ValidationError("Выбран путь к папке, а не к файлу базы")
+        if not target.exists():
+            return {"exists": False, "valid": True, "tables": []}
+        size = target.stat().st_size
+        if size == 0:
+            return {"exists": True, "valid": True, "empty": True, "tables": []}
+        try:
+            with target.open("rb") as handle:
+                header = handle.read(16)
+        except OSError as exc:
+            raise ValidationError(f"Не удалось прочитать файл: {exc}") from exc
+        if header != b"SQLite format 3\x00":
+            raise ValidationError("Файл не является базой данных SQLite")
+        try:
+            conn = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=5)
+            try:
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                required = {
+                    "projects": {"id", "name", "color", "position", "created_at"},
+                    "tasks": {
+                        "id",
+                        "project_id",
+                        "title",
+                        "status",
+                        "position",
+                        "created_at",
+                        "updated_at",
+                    },
+                }
+                if tables and not set(required).issubset(tables):
+                    raise ValidationError("Этот файл не похож на базу Tasker")
+                if tables:
+                    for table, columns in required.items():
+                        actual = {
+                            str(row[1])
+                            for row in conn.execute(f"PRAGMA table_info({table})")
+                        }
+                        if not columns.issubset(actual):
+                            raise ValidationError("Этот файл не похож на базу Tasker")
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            raise ValidationError(f"Не удалось открыть базу SQLite: {exc}") from exc
+        return {"exists": True, "valid": True, "tables": sorted(tables)}
+
+    def switch_path(self, new_path: str | os.PathLike[str]) -> dict[str, Any]:
+        """Переключиться на другую базу, не трогая текущий файл."""
+        target = Path(new_path).expanduser().resolve()
+        with self._lock:
+            if target == self.path:
+                return self.info()
+            self.inspect_path(target)
+            new_conn = self._open_connection(target)
+            try:
+                self._init_schema(new_conn)
+            except BaseException:
+                new_conn.close()
+                raise
+            old_conn = self._conn
+            self.path = target
+            self.data_dir = target.parent
+            self.backup_dir = self.data_dir / "backups"
+            self._conn = new_conn
+            self._revision = 0
+            self._last_write_at = None
+            if old_conn is not None:
+                old_conn.close()
+            return self.info()
 
     # ------------------------------------------------------------------
     # проекты
@@ -359,6 +505,7 @@ class Database:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "done_at": row["done_at"],
+            "scheduled_date": row["scheduled_date"],
         }
 
     def _task_row(self, conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
@@ -378,16 +525,53 @@ class Database:
             ).fetchall()
             return [self._task_dict(row) for row in rows]
 
+    def list_calendar(self, start: str, end: str) -> dict[str, Any]:
+        """Задачи в диапазоне дат и все задачи без даты."""
+        with self.read() as conn:
+            scheduled = conn.execute(
+                "SELECT t.*, p.name AS project_name, p.color AS project_color "
+                "FROM tasks t JOIN projects p ON p.id = t.project_id "
+                "WHERE t.scheduled_date IS NOT NULL "
+                "AND t.scheduled_date >= ? AND t.scheduled_date <= ? "
+                "ORDER BY t.scheduled_date, "
+                "CASE t.status WHEN 'urgent' THEN 0 WHEN 'later' THEN 1 ELSE 2 END, "
+                "t.position, t.created_at",
+                (start, end),
+            ).fetchall()
+            unscheduled = conn.execute(
+                "SELECT t.*, p.name AS project_name, p.color AS project_color "
+                "FROM tasks t JOIN projects p ON p.id = t.project_id "
+                "WHERE t.scheduled_date IS NULL "
+                "ORDER BY p.position, p.created_at, "
+                "CASE t.status WHEN 'urgent' THEN 0 WHEN 'later' THEN 1 ELSE 2 END, "
+                "t.position, t.created_at",
+            ).fetchall()
+
+        def serialize(row: sqlite3.Row) -> dict[str, Any]:
+            data = self._task_dict(row)
+            data["project_name"] = row["project_name"]
+            data["project_color"] = row["project_color"]
+            return data
+
+        return {
+            "start": start,
+            "end": end,
+            "scheduled": [serialize(row) for row in scheduled],
+            "unscheduled": [serialize(row) for row in unscheduled],
+        }
+
     def create_task(
         self,
         project_id: str,
         title: Any,
         description: Any = "",
         status: Any = "urgent",
+        scheduled_date: Any = None,
     ) -> dict[str, Any]:
         clean_title = _clean_title(title, "Название задачи", MAX_TITLE)
         clean_description = _clean_text(description, "Описание", MAX_DESCRIPTION)
         clean_status = _clean_status(status)
+        clean_date = _clean_scheduled_date(scheduled_date)
         with self.write() as conn:
             self._project_row(conn, project_id)
             position_row = conn.execute(
@@ -400,7 +584,8 @@ class Database:
             stamp = now_iso()
             conn.execute(
                 "INSERT INTO tasks(id, project_id, title, description, status, position, "
-                "created_at, updated_at, done_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, updated_at, done_at, scheduled_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     project_id,
@@ -411,6 +596,7 @@ class Database:
                     stamp,
                     stamp,
                     stamp if clean_status == "done" else None,
+                    clean_date,
                 ),
             )
             task = self._task_dict(self._task_row(conn, task_id))
@@ -463,6 +649,7 @@ class Database:
         title: Any = UNSET,
         description: Any = UNSET,
         status: Any = UNSET,
+        scheduled_date: Any = UNSET,
     ) -> dict[str, Any]:
         with self.write() as conn:
             row = self._task_row(conn, task_id)
@@ -475,6 +662,11 @@ class Database:
                 else _clean_text(description, "Описание", MAX_DESCRIPTION)
             )
             new_status = row["status"] if status is UNSET else _clean_status(status)
+            new_scheduled_date = (
+                row["scheduled_date"]
+                if scheduled_date is UNSET
+                else _clean_scheduled_date(scheduled_date)
+            )
 
             if new_status != row["status"]:
                 self._place_task(conn, row, new_status, None)
@@ -486,9 +678,16 @@ class Database:
             if new_status != "done":
                 done_at = None
             conn.execute(
-                "UPDATE tasks SET title = ?, description = ?, done_at = ?, updated_at = ? "
-                "WHERE id = ?",
-                (new_title, new_description, done_at, stamp, task_id),
+                "UPDATE tasks SET title = ?, description = ?, done_at = ?, "
+                "scheduled_date = ?, updated_at = ? WHERE id = ?",
+                (
+                    new_title,
+                    new_description,
+                    done_at,
+                    new_scheduled_date,
+                    stamp,
+                    task_id,
+                ),
             )
             task = self._task_dict(self._task_row(conn, task_id))
             project = self._project_dict(
@@ -741,28 +940,49 @@ class Database:
             }
 
     def info(self) -> dict[str, Any]:
-        try:
-            stat = self.path.stat()
-            size = stat.st_size
-            modified_at = (
-                datetime.fromtimestamp(stat.st_mtime, timezone.utc)
-                .isoformat(timespec="seconds")
-                .replace("+00:00", "Z")
-            )
-        except FileNotFoundError:
-            size = 0
-            modified_at = None
-        return {
-            "db": {
-                "path": str(self.path),
-                "data_dir": str(self.data_dir),
-                "size": size,
-                "modified_at": modified_at,
-                "journal_mode": "DELETE",
-            },
-            "stats": self.stats(),
-            "version": SCHEMA_VERSION,
-        }
+        with self._lock:
+            path = self.path
+            exists = path.exists()
+            try:
+                stat = path.stat()
+                size = stat.st_size
+                modified_at = (
+                    datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z")
+                )
+            except FileNotFoundError:
+                size = 0
+                modified_at = None
+            parent_writable = os.access(path.parent, os.W_OK)
+            file_writable = os.access(path, os.W_OK) if exists else True
+            conn = self._conn
+            try:
+                journal_mode = (
+                    str(conn.execute("PRAGMA journal_mode").fetchone()[0]).upper()
+                    if conn is not None
+                    else "CLOSED"
+                )
+            except sqlite3.Error:
+                journal_mode = "UNKNOWN"
+            return {
+                "db": {
+                    "path": str(path),
+                    "data_dir": str(self.data_dir),
+                    "backup_dir": str(self.backup_dir),
+                    "size": size,
+                    "modified_at": modified_at,
+                    "exists": exists,
+                    "writable": bool(parent_writable and file_writable),
+                    "journal_mode": journal_mode,
+                    "open": conn is not None,
+                    "saved": conn is not None,
+                    "last_write_at": self._last_write_at,
+                    "revision": self._revision,
+                },
+                "stats": self.stats(),
+                "version": SCHEMA_VERSION,
+            }
 
     def backup_to(self, target: str | os.PathLike[str]) -> Path:
         """Сделать целостную копию базы (VACUUM INTO) в указанный файл."""
@@ -770,11 +990,9 @@ class Database:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if target_path.exists():
             raise ValidationError("Файл резервной копии уже существует")
-        conn = self.connect()
-        try:
+        with self._lock:
+            conn = self._connection()
             conn.execute("VACUUM INTO ?", (str(target_path),))
-        finally:
-            conn.close()
         return target_path
 
     def create_backup(self) -> Path:

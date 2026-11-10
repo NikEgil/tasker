@@ -214,6 +214,52 @@ def main() -> None:
         check(status == 200 and data["task"]["title"] == "Переименованная", "задача редактируется")
         check(data["task"]["done_at"] is not None, "у выполненной задачи есть done_at")
 
+        print("\n[2.1] Календарь")
+        status, data = call(
+            "PATCH",
+            f"/api/tasks/{tasks['Срочная задача']['id']}",
+            {"scheduled_date": "2026-11-15"},
+        )
+        check(status == 200 and data["task"]["scheduled_date"] == "2026-11-15", "дата задачи сохраняется")
+        status, data = call(
+            "GET", "/api/calendar?start=2026-11-01&end=2026-11-30"
+        )
+        check(status == 200, "календарь отдаёт данные")
+        check(
+            any(task["id"] == tasks["Срочная задача"]["id"] for task in data["scheduled"]),
+            "задача попала в запланированные",
+        )
+        check(
+            all(task["id"] != tasks["Срочная задача"]["id"] for task in data["unscheduled"]),
+            "запланированная задача не висит в общем списке",
+        )
+        check(
+            data["scheduled"][0]["project_name"] == "Рабочий проект",
+            "в календаре есть название проекта",
+        )
+        status, data = call(
+            "PATCH", f"/api/tasks/{tasks['Срочная задача']['id']}", {"scheduled_date": None}
+        )
+        check(status == 200 and data["task"]["scheduled_date"] is None, "дату можно убрать")
+        status, _ = call(
+            "PATCH", f"/api/tasks/{tasks['Срочная задача']['id']}", {"scheduled_date": "15.11.2026"}
+        )
+        check(status == 400, "некорректная дата отклоняется")
+        status, _ = call(
+            "GET", "/api/calendar?start=2026-11-30&end=2026-11-01"
+        )
+        check(status == 400, "перевёрнутый диапазон дат отклоняется")
+        status, data = call(
+            "POST",
+            f"/api/projects/{project_id}/tasks",
+            {"title": "Сразу с датой", "status": "urgent", "scheduled_date": "2026-12-01"},
+        )
+        check(
+            status == 201 and data["task"]["scheduled_date"] == "2026-12-01",
+            "задачу можно создать сразу с датой",
+        )
+        call("DELETE", f"/api/tasks/{data['task']['id']}")
+
         print("\n[3] Заметки и вложения")
         body, content_type = multipart_body(
             {"text": "Заметка с фотографией и файлом"},

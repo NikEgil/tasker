@@ -3,6 +3,7 @@ import {
   icon,
   formatCardDate,
   formatFullDate,
+  formatDateOnly,
   openModal,
   confirmDialog,
   showMenu,
@@ -65,6 +66,13 @@ export function createBoard({ container, callbacks }) {
                 title="${esc(formatFullDate(dateIso || task.created_at))}">
             ${done ? "готово " : ""}${esc(formatCardDate(dateIso))}
           </time>
+          ${
+            task.scheduled_date
+              ? `<span class="task-scheduled" title="В календаре: ${esc(formatDateOnly(task.scheduled_date, "full"))}">
+                   ${icon("calendar")} ${esc(formatDateOnly(task.scheduled_date))}
+                 </span>`
+              : ""
+          }
         </footer>
       </article>`;
   }
@@ -156,6 +164,14 @@ export function createBoard({ container, callbacks }) {
           <textarea class="textarea" name="description" rows="5" maxlength="20000"
                     placeholder="Детали, ссылки, критерии готовности…">${esc(task?.description || "")}</textarea>
         </label>
+        <div class="field">
+          <label class="field-label" for="task-scheduled-date">Дата в календаре <span class="field-hint">необязательно</span></label>
+          <div class="date-input-row">
+            <input class="input" id="task-scheduled-date" type="date" name="scheduled_date"
+                   value="${esc(task?.scheduled_date || "")}">
+            <button type="button" class="btn btn-quiet btn-sm" data-act="clear-date">Убрать</button>
+          </div>
+        </div>
         <fieldset class="field field-inline">
           <legend class="field-label">Колонка</legend>
           <div class="segmented">
@@ -200,6 +216,7 @@ export function createBoard({ container, callbacks }) {
       onMount({ overlay, close }) {
         const form = overlay.querySelector(`#${formId}`);
         const titleInput = form.querySelector('[name="title"]');
+        const dateInput = form.querySelector('[name="scheduled_date"]');
         const saveButton = overlay.querySelector('[data-act="save"]');
         const deleteButton = overlay.querySelector('[data-act="delete"]');
         let busy = false;
@@ -211,6 +228,10 @@ export function createBoard({ container, callbacks }) {
         };
 
         titleInput.addEventListener("input", () => titleInput.classList.remove("is-invalid"));
+        overlay.querySelector('[data-act="clear-date"]').addEventListener("click", () => {
+          dateInput.value = "";
+          dateInput.focus();
+        });
 
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
@@ -231,6 +252,7 @@ export function createBoard({ container, callbacks }) {
               title,
               description,
               status: selected ? selected.value : status,
+              scheduled_date: dateInput.value || null,
             });
             close();
           } catch (error) {
