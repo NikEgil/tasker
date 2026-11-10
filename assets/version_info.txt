@@ -1,0 +1,32 @@
+# Метаданные Windows для Tasker.exe (формат PyInstaller).
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'Tasker'),
+            StringStruct('FileDescription', 'Tasker - local project manager'),
+            StringStruct('FileVersion', '1.0.0.0'),
+            StringStruct('InternalName', 'Tasker'),
+            StringStruct('OriginalFilename', 'Tasker.exe'),
+            StringStruct('ProductName', 'Tasker'),
+            StringStruct('ProductVersion', '1.0.0')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
