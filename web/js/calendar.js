@@ -58,6 +58,27 @@ export function addDaysKey(value, days) {
   return date ? dateKey(addDays(date, days)) : null;
 }
 
+export function taskDurationDays(task) {
+  const start = dateFromKey(task?.scheduled_date);
+  if (!start) return 1;
+  const end = dateFromKey(task?.scheduled_end_date) || start;
+  if (end < start) return 1;
+  let days = 1;
+  let cursor = start;
+  while (cursor < end && days <= 367) {
+    cursor = addDays(cursor, 1);
+    days += 1;
+  }
+  return days;
+}
+
+export function taskEndKey(task) {
+  if (!task?.scheduled_date) return null;
+  return task.scheduled_end_date && task.scheduled_end_date >= task.scheduled_date
+    ? task.scheduled_end_date
+    : task.scheduled_date;
+}
+
 export function weekStartKey(value = new Date()) {
   const date = value instanceof Date ? new Date(value) : dateFromKey(value);
   if (!date || Number.isNaN(date.getTime())) return null;
@@ -154,6 +175,7 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
   let scheduled = [];
   let unscheduled = [];
   let draggingId = null;
+  let draggingMode = null;
   let dropZone = null;
 
   function setInboxCollapsed(collapsed, { persist = true } = {}) {
@@ -186,50 +208,137 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
   /* -------------------------------------------------------------- */
   /* разметка задач                                                 */
   /* -------------------------------------------------------------- */
-  function taskChipHTML(task, { inbox = false } = {}) {
+  function inboxTaskHTML(task) {
     const done = task.status === "done";
     const status = STATUS_LABELS[task.status] || "";
-    const title = `${task.project_name || "Проект"} · ${status}`;
     return `
-      <div class="calendar-task${done ? " is-done" : ""}${inbox ? " is-inbox-task" : ""}"
+      <div class="calendar-task is-inbox-task${done ? " is-done" : ""}"
            draggable="true" data-calendar-task="${esc(task.id)}"
            style="--task-color:${esc(task.project_color || "#4c6ef5")}"
-           title="${esc(task.title)} — ${esc(title)}">
+           title="${esc(task.title)} — ${esc(`${task.project_name || "Проект"} · ${status}`)}">
         <span class="calendar-task-dot"></span>
         <span class="calendar-task-copy">
           <span class="calendar-task-title">${esc(task.title)}</span>
           <span class="calendar-task-project">${esc(task.project_name || "")}</span>
         </span>
+      </div>`;
+  }
+
+  function taskBarHTML(
+    task,
+    { startCol, endCol, track, orderIndex, orderCount, weekStart, weekEnd }
+  ) {
+    const canUp = orderIndex > 0;
+    const canDown = orderIndex < orderCount - 1;
+    const done = task.status === "done";
+    const days = taskDurationDays(task);
+    const multi = days > 1;
+    const trueEnd = taskEndKey(task);
+    const classes = ["calendar-task"];
+    if (multi) classes.push("is-span");
+    if (done) classes.push("is-done");
+    if (task.scheduled_date < weekStart) classes.push("is-continued-start");
+    if (trueEnd > weekEnd) classes.push("is-continued-end");
+    const canResize = trueEnd <= weekEnd;
+    const project = [task.project_name || "", multi ? `${days} дн.` : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return `
+      <div class="${classes.join(" ")}"
+           draggable="true" data-calendar-task="${esc(task.id)}"
+           style="--task-color:${esc(task.project_color || "#4c6ef5")};
+                  grid-column:${startCol} / ${endCol + 1};
+                  grid-row:${track + 2}"
+           title="${esc(task.title)} — ${esc(`${task.project_name || "Проект"}${multi ? ` · ${days} дн.` : ""}`)}">
+        <span class="calendar-task-order" role="group" aria-label="Порядок задачи ${esc(task.title)}">
+          <button type="button" data-calendar-order="up" ${canUp ? "" : "disabled"}
+                  title="Поднять выше" aria-label="Поднять задачу выше">↑</button>
+          <button type="button" data-calendar-order="down" ${canDown ? "" : "disabled"}
+                  title="Опустить ниже" aria-label="Опустить задачу ниже">↓</button>
+          <button type="button" class="calendar-task-order-remove" data-unschedule="${esc(task.id)}"
+                  title="Убрать из календаря" aria-label="Убрать задачу ${esc(task.title)} из календаря">×</button>
+        </span>
+        <span class="calendar-task-grip" draggable="true" data-order-handle="${esc(task.id)}"
+              title="Перетащите вверх или вниз, чтобы изменить порядок"
+              aria-label="Изменить порядок задачи ${esc(task.title)}">⋮⋮</span>
+        <span class="calendar-task-dot"></span>
+        <span class="calendar-task-copy">
+          <span class="calendar-task-title">${esc(task.title)}</span>
+          <span class="calendar-task-project">${esc(project)}</span>
+        </span>
         ${
-          inbox
-            ? ""
-            : `<button type="button" class="calendar-task-remove" data-unschedule="${esc(task.id)}"
-                       title="Убрать из календаря" aria-label="Убрать задачу ${esc(task.title)} из календаря">
-                 ${icon("x")}
-               </button>`
+          canResize
+            ? `<span class="calendar-task-resize" draggable="true" data-resize-task="${esc(task.id)}"
+                     title="Потяните вправо, чтобы растянуть задачу на другие дни"
+                     aria-label="Растянуть задачу ${esc(task.title)} на другие дни"></span>`
+            : ""
         }
       </div>`;
   }
 
-  function dayCellHTML(date, isOutside, isToday, tasks, { week = false } = {}) {    const key = dateKey(date);
+  function dayCellHTML(date, isOutside, isToday, { column, last = false, week = false } = {}) {
+    const key = dateKey(date);
     const classes = ["calendar-day"];
     if (isOutside) classes.push("is-outside");
     if (isToday) classes.push("is-today");
     if (week) classes.push("is-week-day");
+    if (last) classes.push("is-last-column");
     if ((date.getDay() + 6) % 7 >= 5) classes.push("is-weekend");
-    const head = week
-      ? ""
-      : `<div class="calendar-day-head">
-           <span class="calendar-day-number">${date.getDate()}</span>
-           ${isToday ? '<span class="calendar-day-today">сегодня</span>' : ""}
-         </div>`;
     return `
       <div class="${classes.join(" ")}" data-calendar-date="${key}"
-           role="gridcell" aria-label="${esc(formatDateOnly(key, "full"))}: ${tasks.length}">
-        ${head}
-        <div class="calendar-day-tasks">
-          ${tasks.map((task) => taskChipHTML(task)).join("")}
+           style="grid-column:${column};grid-row:1 / -1"
+           role="gridcell" aria-label="${esc(formatDateOnly(key, "full"))}">
+        <div class="calendar-day-head">
+          <span class="calendar-day-number">${date.getDate()}</span>
+          ${isToday ? '<span class="calendar-day-today">сегодня</span>' : ""}
         </div>
+      </div>`;
+  }
+
+  function weekHTML(start, dayCount, ordered, tracks, { week = false } = {}) {
+    const dates = Array.from({ length: dayCount }, (_, index) => addDays(start, index));
+    const weekStart = dateKey(dates[0]);
+    const weekEnd = dateKey(dates[dates.length - 1]);
+    const cells = dates
+      .map((date, index) =>
+        dayCellHTML(date, week ? false : date.getMonth() !== month, dateKey(date) === todayKey(), {
+          column: index + 1,
+          last: index === dates.length - 1,
+          week,
+        })
+      )
+      .join("");
+    const bars = [];
+    let maxTrack = 0;
+    for (const task of ordered) {
+      const first = dateFromKey(task.scheduled_date);
+      const last = dateFromKey(taskEndKey(task)) || first;
+      if (!first || !last) continue;
+      const visible = dates
+        .map((date, index) => (date >= first && date <= last ? index : -1))
+        .filter((index) => index >= 0);
+      if (!visible.length) continue;
+      const track = tracks.get(task.id);
+      if (track == null) continue;
+      maxTrack = Math.max(maxTrack, track + 1);
+      bars.push(
+        taskBarHTML(task, {
+          startCol: visible[0] + 1,
+          endCol: visible[visible.length - 1] + 1,
+          track,
+          orderIndex: ordered.indexOf(task),
+          orderCount: ordered.length,
+          weekStart,
+          weekEnd,
+        })
+      );
+    }
+    return `
+      <div class="calendar-week${dayCount === 5 ? " is-no-weekends" : ""}"
+           data-week-start="${weekStart}" data-day-count="${dayCount}"
+           style="--calendar-tracks:${Math.max(maxTrack, 1)}">
+        ${cells}
+        ${bars.join("")}
       </div>`;
   }
 
@@ -262,6 +371,28 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
       : tasks.filter((task) => task.status !== "done");
   }
 
+  function packTaskRows(ordered) {
+    const rows = [];
+    const rowById = new Map();
+    for (const task of ordered) {
+      const start = dateFromKey(task.scheduled_date);
+      const end = dateFromKey(taskEndKey(task)) || start;
+      if (!start || !end) continue;
+      let row = 0;
+      while (
+        rows[row]?.some(
+          (interval) => start <= interval.end && end >= interval.start
+        )
+      ) {
+        row += 1;
+      }
+      if (!rows[row]) rows[row] = [];
+      rows[row].push({ start, end });
+      rowById.set(task.id, row);
+    }
+    return rowById;
+  }
+
   function renderInbox() {
     const previousScroll = inbox.scrollTop;
     const visibleUnscheduled = visibleTasks(unscheduled);
@@ -282,22 +413,27 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
         </div>`;
     } else {
       inbox.innerHTML = visibleUnscheduled
-        .map((task) => taskChipHTML(task, { inbox: true }))
+        .map((task) => inboxTaskHTML(task))
         .join("");
     }
     inbox.scrollTop = previousScroll;
   }
 
   function renderGrid() {
-    const today = todayKey();
-    const tasksByDay = new Map();
-    for (const task of visibleTasks(scheduled)) {
-      if (!task.scheduled_date) continue;
-      if (!tasksByDay.has(task.scheduled_date)) tasksByDay.set(task.scheduled_date, []);
-      tasksByDay.get(task.scheduled_date).push(task);
-    }
-
     const isWeek = mode === "week";
+    const ordered = [...visibleTasks(scheduled)].sort(
+      (a, b) =>
+        (Number.isFinite(Number(a.calendar_order))
+          ? Number(a.calendar_order)
+          : Number.MAX_SAFE_INTEGER) -
+          (Number.isFinite(Number(b.calendar_order))
+            ? Number(b.calendar_order)
+            : Number.MAX_SAFE_INTEGER) ||
+        String(a.scheduled_date || "").localeCompare(String(b.scheduled_date || "")) ||
+        (a.position ?? 0) - (b.position ?? 0)
+    );
+    const tracks = packTaskRows(ordered);
+
     board.classList.toggle("is-week-view", isWeek);
     board.classList.toggle("is-no-weekends", !showWeekends);
     board.setAttribute("aria-label", isWeek ? "Неделя" : "Месяц");
@@ -309,20 +445,10 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
       button.setAttribute("aria-pressed", String(active));
     });
 
-    const cells = [];
     if (isWeek) {
       const start = dateFromKey(weekStartDate) || new Date();
       const dayCount = showWeekends ? 7 : 5;
-      for (let index = 0; index < dayCount; index += 1) {
-        const date = addDays(start, index);
-        const key = dateKey(date);
-        cells.push(
-          dayCellHTML(date, false, key === today, tasksByDay.get(key) || [], {
-            week: true,
-          })
-        );
-      }
-      grid.innerHTML = cells.join("");
+      grid.innerHTML = weekHTML(start, dayCount, ordered, tracks, { week: true });
       const title = weekTitle(weekStartDate, dayCount - 1);
       monthLabel.textContent = title;
       monthLabel.title = title;
@@ -332,22 +458,12 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
       nextButton.setAttribute("title", "Следующая неделя");
     } else {
       const start = startOfGrid(year, month);
-      const rows = showWeekends ? GRID_DAYS : 30;
-      for (let index = 0; index < rows; index += 1) {
-        const date = showWeekends
-          ? addDays(start, index)
-          : addDays(start, Math.floor(index / 5) * 7 + (index % 5));
-        const key = dateKey(date);
-        cells.push(
-          dayCellHTML(
-            date,
-            date.getMonth() !== month,
-            key === today,
-            tasksByDay.get(key) || []
-          )
-        );
+      const dayCount = showWeekends ? 7 : 5;
+      const weeks = [];
+      for (let row = 0; row < 6; row += 1) {
+        weeks.push(weekHTML(addDays(start, row * 7), dayCount, ordered, tracks));
       }
-      grid.innerHTML = cells.join("");
+      grid.innerHTML = weeks.join("");
       const title = monthTitle(year, month);
       monthLabel.textContent = title;
       monthLabel.title = title;
@@ -405,8 +521,8 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
   /* перетаскивание                                                 */
   /* -------------------------------------------------------------- */
   function clearDropTargets() {
-    root.querySelectorAll(".is-drop-target").forEach((element) => {
-      element.classList.remove("is-drop-target");
+    root.querySelectorAll(".is-drop-target, .is-order-target").forEach((element) => {
+      element.classList.remove("is-drop-target", "is-order-target");
     });
     dropZone = null;
   }
@@ -418,23 +534,57 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
     });
     clearDropTargets();
     draggingId = null;
+    draggingMode = null;
   }
 
   function dropTarget(event) {
     const inboxElement = event.target.closest("#calendar-inbox");
     if (inboxElement) return { type: "inbox", element: inboxElement };
-    const day = event.target.closest("[data-calendar-date]");
-    if (day) return { type: "day", date: day.dataset.calendarDate, element: day };
+    const week = event.target.closest(".calendar-week");
+    if (week) {
+      const rect = week.getBoundingClientRect();
+      const count = Number(week.dataset.dayCount) || 7;
+      const ratio = rect.width
+        ? Math.max(0, Math.min(0.999, (event.clientX - rect.left) / rect.width))
+        : 0;
+      const date = addDaysKey(week.dataset.weekStart, Math.floor(ratio * count));
+      const day = week.querySelector(`[data-calendar-date="${date}"]`);
+      return { type: "day", date, element: day || week };
+    }
     return null;
   }
 
   root.addEventListener("dragstart", (event) => {
+    const handle = event.target.closest("[data-order-handle]");
+    if (handle) {
+      draggingId = handle.dataset.orderHandle;
+      draggingMode = "order";
+      root.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", draggingId);
+      return;
+    }
+    const resize = event.target.closest("[data-resize-task]");
+    if (resize) {
+      draggingId = resize.dataset.resizeTask;
+      draggingMode = "resize";
+      root.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", draggingId);
+      return;
+    }
     const task = event.target.closest("[data-calendar-task]");
-    if (!task || event.target.closest(".calendar-task-remove")) {
-      if (event.target.closest(".calendar-task-remove")) event.preventDefault();
+    if (
+      !task ||
+      event.target.closest(".calendar-task-remove") ||
+      event.target.closest("[data-unschedule]") ||
+      event.target.closest("[data-calendar-order]")
+    ) {
+      event.preventDefault();
       return;
     }
     draggingId = task.dataset.calendarTask;
+    draggingMode = "move";
     task.classList.add("is-dragging");
     root.classList.add("is-dragging");
     event.dataTransfer.effectAllowed = "move";
@@ -443,6 +593,18 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
 
   root.addEventListener("dragover", (event) => {
     if (!draggingId) return;
+    if (draggingMode === "order") {
+      const target = event.target.closest("[data-calendar-task]");
+      if (!target || target.dataset.calendarTask === draggingId) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      if (dropZone !== target) {
+        clearDropTargets();
+        target.classList.add("is-order-target");
+        dropZone = target;
+      }
+      return;
+    }
     const target = dropTarget(event);
     if (!target) return;
     event.preventDefault();
@@ -462,16 +624,35 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
 
   root.addEventListener("drop", (event) => {
     if (!draggingId) return;
+    const taskId = draggingId;
+    const mode = draggingMode;
+    if (mode === "order") {
+      const target = event.target.closest("[data-calendar-task]");
+      if (!target || target.dataset.calendarTask === taskId) {
+        cleanupDrag();
+        return;
+      }
+      event.preventDefault();
+      const rect = target.getBoundingClientRect();
+      const before = event.clientY < rect.top + rect.height / 2;
+      const targetId = target.dataset.calendarTask;
+      cleanupDrag();
+      callbacks.onReorder?.(taskId, { targetId, before });
+      return;
+    }
     const target = dropTarget(event);
     if (!target) {
       cleanupDrag();
       return;
     }
     event.preventDefault();
-    const taskId = draggingId;
     const date = target.type === "day" ? target.date : null;
     cleanupDrag();
-    callbacks.onSchedule(taskId, date);
+    if (mode === "resize") {
+      if (date) callbacks.onResize?.(taskId, date);
+    } else {
+      callbacks.onSchedule(taskId, date);
+    }
   });
 
   root.addEventListener("dragend", () => {
@@ -479,6 +660,26 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
   });
 
   root.addEventListener("click", (event) => {
+    if (event.target.closest("[data-resize-task]")) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (event.target.closest("[data-order-handle]")) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    const order = event.target.closest("[data-calendar-order]");
+    if (order) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!order.disabled) {
+        const task = order.closest("[data-calendar-task]");
+        if (task) callbacks.onReorder?.(task.dataset.calendarTask, order.dataset.calendarOrder);
+      }
+      return;
+    }
     const remove = event.target.closest("[data-unschedule]");
     if (!remove) return;
     event.preventDefault();
@@ -487,7 +688,12 @@ export function createCalendar({ root, callbacks, preferences = {} }) {
   });
 
   root.addEventListener("dblclick", (event) => {
-    if (event.target.closest("button, a, input, textarea, select")) return;
+    if (
+      event.target.closest(
+        "button, a, input, textarea, select, [data-resize-task], [data-order-handle]"
+      )
+    )
+      return;
     const task = event.target.closest("[data-calendar-task]");
     if (task) {
       event.preventDefault();

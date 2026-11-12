@@ -1,23 +1,32 @@
 """SQLite-хранилище Tasker.
 
-Вся информация приложения — проекты, задачи, заметки и вложения — лежит
-в одном файле базы данных. Это делает файл самодостаточным: его можно
-скопировать, забрать на другой компьютер или синхронизировать облаком.
+Проекты, задачи и заметки лежат в текстовой базе данных, а вложения — в
+отдельной папке рядом с ней. Это позволяет синхронизировать только текст и
+скачивать тяжёлые файлы по необходимости.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
 import threading
 import uuid
+import zipfile
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
+
+
+def files_dir_for_db(path: str | os.PathLike[str]) -> Path:
+    """Папка с вложениями, расположенная рядом с файлом базы."""
+    database = Path(path).expanduser().resolve()
+    return database.parent / f"{database.stem}_files"
 
 STATUSES = ("urgent", "later", "done")
 STATUS_LABELS = {"urgent": "Срочно", "later": "Потом", "done": "Сделано"}
@@ -77,7 +86,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     done_at     TEXT,
-    scheduled_date TEXT
+    scheduled_date TEXT,
+    scheduled_end_date TEXT,
+    calendar_order INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -89,14 +100,14 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE TABLE IF NOT EXISTS attachments (
-    id         TEXT PRIMARY KEY,
-    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    filename   TEXT NOT NULL,
-    mime       TEXT NOT NULL,
-    size       INTEGER NOT NULL,
-    data       BLOB NOT NULL,
-    created_at TEXT NOT NULL
+    id           TEXT PRIMARY KEY,
+    message_id   TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    filename     TEXT NOT NULL,
+    mime         TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    storage_path TEXT NOT NULL,
+    created_at   TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status
@@ -188,6 +199,28 @@ def _clean_scheduled_date(value: Any) -> str | None:
     return value
 
 
+def _clean_scheduled_range(
+    start: Any, end: Any
+) -> tuple[str | None, str | None]:
+    """Проверить диапазон задачи; одиночный день хранится как NULL."""
+    clean_start = _clean_scheduled_date(start)
+    clean_end = _clean_scheduled_date(end)
+    if clean_start is None:
+        if clean_end is not None:
+            raise ValidationError("Дата окончания указана без даты начала")
+        return None, None
+    if clean_end is not None:
+        start_day = date.fromisoformat(clean_start)
+        end_day = date.fromisoformat(clean_end)
+        if end_day < start_day:
+            raise ValidationError("Дата окончания раньше даты начала")
+        if (end_day - start_day).days > 366:
+            raise ValidationError("Задача не может длиться больше года")
+        if end_day == start_day:
+            clean_end = None
+    return clean_start, clean_end
+
+
 def clean_filename(value: Any) -> str:
     name = str(value or "").replace("\\", "/").split("/")[-1]
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip().strip(".")
@@ -213,14 +246,17 @@ class Database:
         self._last_write_at: str | None = None
         target = Path(path).expanduser().resolve()
         self.inspect_path(target)
+        files_dir = files_dir_for_db(target)
+        self._backup_before_migration(target)
         conn = self._open_connection(target)
         try:
-            self._init_schema(conn)
+            self._init_schema(conn, files_dir)
         except BaseException:
             conn.close()
             raise
         self.path = target
         self.data_dir = target.parent
+        self.files_dir = files_dir
         self.backup_dir = self.data_dir / "backups"
         self._conn = conn
 
@@ -246,22 +282,161 @@ class Database:
         return conn
 
     @staticmethod
-    def _init_schema(conn: sqlite3.Connection) -> None:
-        conn.executescript(_SCHEMA)
+    def _backup_before_migration(target: Path) -> None:
+        """Перед переносом BLOB-вложений сохранить исходный файл базы."""
+        if not target.is_file() or target.stat().st_size == 0:
+            return
+        try:
+            conn = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=5)
+            try:
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                if "attachments" not in tables:
+                    return
+                columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(attachments)")
+                }
+                if "data" not in columns:
+                    return
+            finally:
+                conn.close()
+            backup_dir = target.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            candidate = backup_dir / f"pre-v3-{stamp}.db"
+            suffix = 2
+            while candidate.exists():
+                candidate = backup_dir / f"pre-v3-{stamp}-{suffix}.db"
+                suffix += 1
+            shutil.copy2(target, candidate)
+        except (OSError, sqlite3.Error):
+            # Миграция всё равно должна попробовать выполниться.
+            return
 
-        # Мягкая миграция: старые базы получают новые поля без перезаписи.
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
-        if "scheduled_date" not in columns:
-            conn.execute("ALTER TABLE tasks ADD COLUMN scheduled_date TEXT")
+    @staticmethod
+    def _init_schema(conn: sqlite3.Connection, files_dir: Path) -> None:
+        conn.executescript(_SCHEMA)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Мягкая миграция: старые базы получают новые поля без перезаписи.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+            if "scheduled_date" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN scheduled_date TEXT")
+            if "scheduled_end_date" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN scheduled_end_date TEXT")
+            if "calendar_order" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN calendar_order INTEGER")
+            # Старые задачи получают порядок один раз: длинные полосы выше,
+            # дальше — по дате. Дальше порядок меняется только вручную.
+            pending = conn.execute(
+                "SELECT id, scheduled_end_date, scheduled_date, status, position, created_at "
+                "FROM tasks WHERE scheduled_date IS NOT NULL AND calendar_order IS NULL "
+                "ORDER BY CASE WHEN scheduled_end_date IS NOT NULL "
+                "AND scheduled_end_date > scheduled_date THEN 0 ELSE 1 END, "
+                "scheduled_date, CASE status WHEN 'urgent' THEN 0 WHEN 'later' THEN 1 ELSE 2 END, "
+                "position, created_at"
+            ).fetchall()
+            for order, row in enumerate(pending):
+                conn.execute(
+                    "UPDATE tasks SET calendar_order = ? WHERE id = ?",
+                    (order, row["id"]),
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_scheduled ON tasks(scheduled_date)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_end "
+                "ON tasks(scheduled_end_date)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_calendar_order "
+                "ON tasks(calendar_order)"
+            )
+            Database._migrate_attachments(conn, files_dir)
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_attachments(conn: sqlite3.Connection, files_dir: Path) -> None:
+        """Перенести старые BLOB-вложения в папку рядом с базой."""
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(attachments)")
+        }
+        if "storage_path" in columns and "data" not in columns:
+            return
+
+        files_dir.mkdir(parents=True, exist_ok=True)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_scheduled ON tasks(scheduled_date)"
+            """
+            CREATE TABLE IF NOT EXISTS attachments_v3 (
+                id           TEXT PRIMARY KEY,
+                message_id   TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                filename     TEXT NOT NULL,
+                mime         TEXT NOT NULL,
+                size         INTEGER NOT NULL,
+                storage_path TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            )
+            """
+        )
+        rows = conn.execute(
+            "SELECT id, message_id, project_id, filename, mime, size, "
+            f"{'storage_path' if 'storage_path' in columns else 'NULL AS storage_path'}, "
+            f"{'data' if 'data' in columns else 'NULL AS data'}, created_at "
+            "FROM attachments"
+        ).fetchall()
+        for row in rows:
+            relative = str(row["storage_path"] or "")
+            if not relative:
+                relative = f"{row['id'][:2]}/{row['id']}.bin"
+                target = files_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                payload = row["data"]
+                if payload is None:
+                    payload = b""
+                temporary = target.with_name(target.name + f".tmp-{uuid.uuid4().hex}")
+                try:
+                    temporary.write_bytes(bytes(payload))
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            conn.execute(
+                "INSERT OR REPLACE INTO attachments_v3"
+                "(id, message_id, project_id, filename, mime, size, storage_path, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["id"],
+                    row["message_id"],
+                    row["project_id"],
+                    row["filename"],
+                    row["mime"],
+                    row["size"],
+                    relative,
+                    row["created_at"],
+                ),
+            )
+        conn.execute("DROP TABLE attachments")
+        conn.execute("ALTER TABLE attachments_v3 RENAME TO attachments")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attachments_message "
+            "ON attachments(message_id)"
         )
         conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(SCHEMA_VERSION),),
+            "CREATE INDEX IF NOT EXISTS idx_attachments_project "
+            "ON attachments(project_id)"
         )
-        conn.commit()
 
     def _connection(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -363,15 +538,18 @@ class Database:
             if target == self.path:
                 return self.info()
             self.inspect_path(target)
+            self._backup_before_migration(target)
             new_conn = self._open_connection(target)
+            new_files_dir = files_dir_for_db(target)
             try:
-                self._init_schema(new_conn)
+                self._init_schema(new_conn, new_files_dir)
             except BaseException:
                 new_conn.close()
                 raise
             old_conn = self._conn
             self.path = target
             self.data_dir = target.parent
+            self.files_dir = new_files_dir
             self.backup_dir = self.data_dir / "backups"
             self._conn = new_conn
             self._revision = 0
@@ -515,7 +693,15 @@ class Database:
     def delete_project(self, project_id: str) -> None:
         with self.write() as conn:
             self._project_row(conn, project_id)
+            paths = [
+                row["storage_path"]
+                for row in conn.execute(
+                    "SELECT storage_path FROM attachments WHERE project_id = ?",
+                    (project_id,),
+                )
+            ]
             conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self._remove_attachment_files(paths)
 
     # ------------------------------------------------------------------
     # задачи
@@ -533,6 +719,8 @@ class Database:
             "updated_at": row["updated_at"],
             "done_at": row["done_at"],
             "scheduled_date": row["scheduled_date"],
+            "scheduled_end_date": row["scheduled_end_date"],
+            "calendar_order": row["calendar_order"],
         }
 
     def _task_row(self, conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
@@ -559,11 +747,12 @@ class Database:
                 "SELECT t.*, p.name AS project_name, p.color AS project_color "
                 "FROM tasks t JOIN projects p ON p.id = t.project_id "
                 "WHERE t.scheduled_date IS NOT NULL "
-                "AND t.scheduled_date >= ? AND t.scheduled_date <= ? "
+                "AND t.scheduled_date <= ? "
+                "AND COALESCE(t.scheduled_end_date, t.scheduled_date) >= ? "
                 "ORDER BY t.scheduled_date, "
                 "CASE t.status WHEN 'urgent' THEN 0 WHEN 'later' THEN 1 ELSE 2 END, "
                 "t.position, t.created_at",
-                (start, end),
+                (end, start),
             ).fetchall()
             unscheduled = conn.execute(
                 "SELECT t.*, p.name AS project_name, p.color AS project_color "
@@ -587,6 +776,20 @@ class Database:
             "unscheduled": [serialize(row) for row in unscheduled],
         }
 
+    @staticmethod
+    def _calendar_order_for(conn: sqlite3.Connection, multi: bool) -> int:
+        if multi:
+            row = conn.execute(
+                "SELECT COALESCE(MIN(calendar_order), 0) - 1 AS o "
+                "FROM tasks WHERE scheduled_date IS NOT NULL"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(calendar_order), -1) + 1 AS o "
+                "FROM tasks WHERE scheduled_date IS NOT NULL"
+            ).fetchone()
+        return int(row["o"])
+
     def create_task(
         self,
         project_id: str,
@@ -594,11 +797,14 @@ class Database:
         description: Any = "",
         status: Any = "urgent",
         scheduled_date: Any = None,
+        scheduled_end_date: Any = None,
     ) -> dict[str, Any]:
         clean_title = _clean_title(title, "Название задачи", MAX_TITLE)
         clean_description = _clean_text(description, "Описание", MAX_DESCRIPTION)
         clean_status = _clean_status(status)
-        clean_date = _clean_scheduled_date(scheduled_date)
+        clean_date, clean_end_date = _clean_scheduled_range(
+            scheduled_date, scheduled_end_date
+        )
         with self.write() as conn:
             self._project_row(conn, project_id)
             position_row = conn.execute(
@@ -607,12 +813,18 @@ class Database:
                 (project_id, clean_status),
             ).fetchone()
             position = int(position_row["p"])
+            calendar_order = (
+                None
+                if clean_date is None
+                else self._calendar_order_for(conn, clean_end_date is not None)
+            )
             task_id = new_id()
             stamp = now_iso()
             conn.execute(
                 "INSERT INTO tasks(id, project_id, title, description, status, position, "
-                "created_at, updated_at, done_at, scheduled_date) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, updated_at, done_at, scheduled_date, scheduled_end_date, "
+                "calendar_order) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     project_id,
@@ -624,6 +836,8 @@ class Database:
                     stamp,
                     stamp if clean_status == "done" else None,
                     clean_date,
+                    clean_end_date,
+                    calendar_order,
                 ),
             )
             task = self._task_dict(self._task_row(conn, task_id))
@@ -670,6 +884,28 @@ class Database:
                     "UPDATE tasks SET position = ? WHERE id = ?", (position, sibling_id)
                 )
 
+    def reorder_calendar(self, task_ids: Any) -> None:
+        """Задать ручной вертикальный порядок задач в календаре."""
+        if not isinstance(task_ids, list):
+            raise ValidationError("Ожидается список задач")
+        if len(task_ids) > 5000:
+            raise ValidationError("Слишком много задач")
+        clean_ids: list[str] = []
+        for value in task_ids:
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+                raise ValidationError("Некорректный идентификатор задачи")
+            if value in clean_ids:
+                raise ValidationError("Задача указана дважды")
+            clean_ids.append(value)
+        with self.write() as conn:
+            for task_id in clean_ids:
+                self._task_row(conn, task_id)
+            for order, task_id in enumerate(clean_ids):
+                conn.execute(
+                    "UPDATE tasks SET calendar_order = ? WHERE id = ?",
+                    (order, task_id),
+                )
+
     def update_task(
         self,
         task_id: str,
@@ -677,6 +913,7 @@ class Database:
         description: Any = UNSET,
         status: Any = UNSET,
         scheduled_date: Any = UNSET,
+        scheduled_end_date: Any = UNSET,
     ) -> dict[str, Any]:
         with self.write() as conn:
             row = self._task_row(conn, task_id)
@@ -689,11 +926,48 @@ class Database:
                 else _clean_text(description, "Описание", MAX_DESCRIPTION)
             )
             new_status = row["status"] if status is UNSET else _clean_status(status)
-            new_scheduled_date = (
-                row["scheduled_date"]
-                if scheduled_date is UNSET
-                else _clean_scheduled_date(scheduled_date)
-            )
+            old_start = row["scheduled_date"]
+            old_end = row["scheduled_end_date"] or old_start
+            if scheduled_date is UNSET and scheduled_end_date is UNSET:
+                new_scheduled_date = old_start
+                new_end_date = row["scheduled_end_date"]
+            elif scheduled_date is UNSET:
+                new_scheduled_date = old_start
+                new_end_date = _clean_scheduled_date(scheduled_end_date)
+                new_scheduled_date, new_end_date = _clean_scheduled_range(
+                    new_scheduled_date, new_end_date
+                )
+            elif scheduled_end_date is UNSET:
+                new_scheduled_date, _ = _clean_scheduled_range(scheduled_date, None)
+                if new_scheduled_date is None:
+                    new_end_date = None
+                else:
+                    # При переносе только начала сохраняем прежнюю длительность.
+                    duration = 0
+                    if old_start and old_end:
+                        duration = (
+                            date.fromisoformat(old_end) - date.fromisoformat(old_start)
+                        ).days
+                    shifted = (
+                        date.fromisoformat(new_scheduled_date)
+                        + timedelta(days=duration)
+                    ).isoformat()
+                    new_scheduled_date, new_end_date = _clean_scheduled_range(
+                        new_scheduled_date, shifted
+                    )
+            else:
+                new_scheduled_date, new_end_date = _clean_scheduled_range(
+                    scheduled_date, scheduled_end_date
+                )
+            new_calendar_order = row["calendar_order"]
+            if (
+                old_start is None
+                and new_scheduled_date is not None
+                and row["calendar_order"] is None
+            ):
+                new_calendar_order = self._calendar_order_for(
+                    conn, new_end_date is not None
+                )
 
             if new_status != row["status"]:
                 self._place_task(conn, row, new_status, None)
@@ -706,12 +980,15 @@ class Database:
                 done_at = None
             conn.execute(
                 "UPDATE tasks SET title = ?, description = ?, done_at = ?, "
-                "scheduled_date = ?, updated_at = ? WHERE id = ?",
+                "scheduled_date = ?, scheduled_end_date = ?, calendar_order = ?, "
+                "updated_at = ? WHERE id = ?",
                 (
                     new_title,
                     new_description,
                     done_at,
                     new_scheduled_date,
+                    new_end_date,
+                    new_calendar_order,
                     stamp,
                     task_id,
                 ),
@@ -760,6 +1037,71 @@ class Database:
             "is_image": mime in IMAGE_MIME_TYPES,
             "url": f"/api/attachments/{data['id']}",
         }
+
+    def _attachment_path(self, storage_path: str) -> Path:
+        relative = Path(storage_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise NotFoundError("Файл не найден")
+        target = (self.files_dir / relative).resolve()
+        try:
+            target.relative_to(self.files_dir.resolve())
+        except ValueError:
+            raise NotFoundError("Файл не найден") from None
+        if not target.is_file():
+            raise NotFoundError("Файл не найден")
+        return target
+
+    def _write_attachment_file(self, attachment_id: str, data: bytes) -> Path:
+        relative = Path(attachment_id[:2]) / f"{attachment_id}.bin"
+        target = self.files_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + f".tmp-{uuid.uuid4().hex}")
+        try:
+            with temporary.open("wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return target
+
+    def _remove_attachment_files(self, storage_paths: list[str]) -> None:
+        for storage_path in storage_paths:
+            try:
+                self._attachment_path(storage_path).unlink(missing_ok=True)
+            except (NotFoundError, OSError):
+                continue
+
+    def attachment_files(self) -> list[Path]:
+        """Все существующие файлы, на которые ссылается база."""
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT storage_path FROM attachments ORDER BY id"
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                result.append(self._attachment_path(row["storage_path"]))
+            except NotFoundError:
+                continue
+        return result
+
+    def copy_attachment_files(self, destination: Path) -> int:
+        """Скопировать файлы вложений в указанную папку, сохраняя пути."""
+        destination.mkdir(parents=True, exist_ok=True)
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT storage_path FROM attachments ORDER BY id"
+            ).fetchall()
+        copied = 0
+        for row in rows:
+            source = self._attachment_path(row["storage_path"])
+            target = destination / Path(row["storage_path"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            copied += 1
+        return copied
 
     def _attachments_for(
         self, conn: sqlite3.Connection, message_ids: list[str]
@@ -875,21 +1217,31 @@ class Database:
                 "VALUES (?, ?, ?, ?, ?)",
                 (message_id, project_id, clean_body, stamp, stamp),
             )
-            for file in prepared:
-                conn.execute(
-                    "INSERT INTO attachments(id, message_id, project_id, filename, mime, "
-                    "size, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        file["id"],
-                        message_id,
-                        project_id,
-                        file["filename"],
-                        file["mime"],
-                        file["size"],
-                        sqlite3.Binary(file["data"]),
-                        stamp,
-                    ),
-                )
+            written: list[Path] = []
+            try:
+                for file in prepared:
+                    storage_path = self._write_attachment_file(
+                        file["id"], file["data"]
+                    )
+                    written.append(storage_path)
+                    conn.execute(
+                        "INSERT INTO attachments(id, message_id, project_id, filename, mime, "
+                        "size, storage_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            file["id"],
+                            message_id,
+                            project_id,
+                            file["filename"],
+                            file["mime"],
+                            file["size"],
+                            storage_path.relative_to(self.files_dir).as_posix(),
+                            stamp,
+                        ),
+                    )
+            except BaseException:
+                for path in written:
+                    path.unlink(missing_ok=True)
+                raise
             row = conn.execute(
                 "SELECT * FROM messages WHERE id = ?", (message_id,)
             ).fetchone()
@@ -930,9 +1282,18 @@ class Database:
             if row is None:
                 raise NotFoundError("Заметка не найдена")
             project_id = row["project_id"]
+            paths = [
+                item["storage_path"]
+                for item in conn.execute(
+                    "SELECT storage_path FROM attachments WHERE message_id = ?",
+                    (message_id,),
+                )
+            ]
             conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
             project = self._project_dict(conn, self._project_row(conn, project_id))
-            return {"ok": True, "project": project}
+            result = {"ok": True, "project": project}
+        self._remove_attachment_files(paths)
+        return result
 
     def get_attachment(self, attachment_id: str) -> dict[str, Any]:
         with self.read() as conn:
@@ -942,7 +1303,7 @@ class Database:
             if row is None:
                 raise NotFoundError("Файл не найден")
             data = dict(row)
-            data["data"] = bytes(row["data"])
+            data["data"] = self._attachment_path(row["storage_path"]).read_bytes()
             return data
 
     # ------------------------------------------------------------------
@@ -996,6 +1357,7 @@ class Database:
                 "db": {
                     "path": str(path),
                     "data_dir": str(self.data_dir),
+                    "files_dir": str(self.files_dir),
                     "backup_dir": str(self.backup_dir),
                     "size": size,
                     "modified_at": modified_at,
@@ -1011,6 +1373,122 @@ class Database:
                 "version": SCHEMA_VERSION,
             }
 
+    def replace_from_snapshot(
+        self,
+        source_db: str | os.PathLike[str],
+        source_files: str | os.PathLike[str] | None,
+    ) -> dict[str, Any]:
+        """Заменить локальную базу и папку файлов данными с Диска."""
+        source = Path(source_db).expanduser().resolve()
+        files_source = (
+            Path(source_files).expanduser().resolve()
+            if source_files
+            else None
+        )
+        self.inspect_path(source)
+        if not source.is_file():
+            raise ValidationError("Файл базы с Диска не найден")
+
+        with self._lock:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            backup_db = self.backup_dir / f"sync-before-{stamp}.db"
+            self.backup_to(backup_db)
+
+            old_files = None
+            if self.files_dir.exists():
+                old_files = self.backup_dir / f"sync-before-{stamp}-files"
+                suffix = 2
+                while old_files.exists():
+                    old_files = self.backup_dir / f"sync-before-{stamp}-files-{suffix}"
+                    suffix += 1
+                os.replace(self.files_dir, old_files)
+
+            staging_files = self.files_dir.with_name(
+                f".{self.files_dir.name}.incoming-{uuid.uuid4().hex}"
+            )
+            try:
+                source_conn = sqlite3.connect(
+                    f"{source.as_uri()}?mode=ro", uri=True, timeout=20
+                )
+                try:
+                    source_conn.backup(self._connection())
+                finally:
+                    source_conn.close()
+                if files_source is not None and files_source.is_dir():
+                    shutil.copytree(files_source, staging_files)
+                else:
+                    staging_files.mkdir(parents=True, exist_ok=True)
+                os.replace(staging_files, self.files_dir)
+                self._init_schema(self._connection(), self.files_dir)
+                missing = [
+                    relative
+                    for (relative,) in self._connection().execute(
+                        "SELECT storage_path FROM attachments"
+                    )
+                    if not (self.files_dir / relative).is_file()
+                ]
+                if missing:
+                    raise ValidationError(
+                        "В базе с Диска не хватает файлов вложений"
+                    )
+                self._revision = 0
+                self._last_write_at = None
+            except BaseException:
+                if staging_files.exists():
+                    shutil.rmtree(staging_files, ignore_errors=True)
+                # Попытаться вернуть прежнюю базу и файлы.
+                try:
+                    if backup_db.exists():
+                        restore_conn = sqlite3.connect(
+                            f"{backup_db.as_uri()}?mode=ro", uri=True, timeout=20
+                        )
+                        try:
+                            restore_conn.backup(self._connection())
+                        finally:
+                            restore_conn.close()
+                    if old_files is not None and old_files.exists():
+                        if self.files_dir.exists():
+                            shutil.rmtree(self.files_dir, ignore_errors=True)
+                        os.replace(old_files, self.files_dir)
+                except BaseException:
+                    pass
+                raise
+        return self.info()
+
+    def backup_archive_to(self, target: str | os.PathLike[str]) -> Path:
+        """Сохранить базу и папку файлов в один ZIP-архив."""
+        target_path = Path(target).expanduser().resolve()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            raise ValidationError("Файл резервной копии уже существует")
+        with tempfile.TemporaryDirectory(prefix="tasker-archive-") as tmp:
+            snapshot = Path(tmp) / "tasker.db"
+            self.backup_to(snapshot)
+            with zipfile.ZipFile(
+                target_path, "w", compression=zipfile.ZIP_STORED
+            ) as archive:
+                archive.write(snapshot, "tasker.db")
+                with self.read() as conn:
+                    rows = conn.execute(
+                        "SELECT storage_path FROM attachments ORDER BY id"
+                    ).fetchall()
+                for row in rows:
+                    relative = Path(row["storage_path"])
+                    source = self._attachment_path(row["storage_path"])
+                    archive.write(source, f"tasker_files/{relative.as_posix()}")
+        return target_path
+
+    def create_backup(self) -> Path:
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        candidate = self.backup_dir / f"tasker-{stamp}.zip"
+        suffix = 2
+        while candidate.exists():
+            candidate = self.backup_dir / f"tasker-{stamp}-{suffix}.zip"
+            suffix += 1
+        return self.backup_archive_to(candidate)
+
     def backup_to(self, target: str | os.PathLike[str]) -> Path:
         """Сделать целостную копию базы (VACUUM INTO) в указанный файл."""
         target_path = Path(target).expanduser().resolve()
@@ -1022,12 +1500,3 @@ class Database:
             conn.execute("VACUUM INTO ?", (str(target_path),))
         return target_path
 
-    def create_backup(self) -> Path:
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        candidate = self.backup_dir / f"tasker-{stamp}.db"
-        suffix = 2
-        while candidate.exists():
-            candidate = self.backup_dir / f"tasker-{stamp}-{suffix}.db"
-            suffix += 1
-        return self.backup_to(candidate)

@@ -21,6 +21,7 @@ import {
   addDaysKey,
   dateFromKey,
   dateKey,
+  taskDurationDays,
   todayKey,
   weekStartKey,
   weekRange,
@@ -85,6 +86,12 @@ const elements = {
   chatResizer: document.getElementById("chat-resizer"),
   chatBackdrop: document.getElementById("chat-backdrop"),
   board: document.getElementById("board"),
+  syncVersionCard: document.getElementById("sync-version-card"),
+  syncVersionNumber: document.getElementById("sync-version-number"),
+  syncVersionMeta: document.getElementById("sync-version-meta"),
+  syncVersionDot: document.getElementById("sync-version-dot"),
+  quickSyncPull: document.getElementById("quick-sync-pull"),
+  quickSyncPush: document.getElementById("quick-sync-push"),
 };
 
 let board = null;
@@ -94,6 +101,8 @@ let mobileChatOpen = false;
 let wasMobile = null;
 let projectDragId = null;
 let projectOrderBusy = false;
+let quickSyncBusy = false;
+let quickSyncRemoteRequest = 0;
 
 const CHAT_WIDTH_KEY = "tasker-chat-width";
 const DEFAULT_CHAT_WIDTH = 388;
@@ -570,12 +579,16 @@ function findCalendarTask(taskId) {
   );
 }
 
+function calendarTaskOrder(task) {
+  const order = Number(task?.calendar_order);
+  return Number.isFinite(order) ? order : Number.MAX_SAFE_INTEGER;
+}
+
 function sortCalendarTasks(tasks) {
-  const statusOrder = { urgent: 0, later: 1, done: 2 };
   return [...tasks].sort(
     (a, b) =>
+      calendarTaskOrder(a) - calendarTaskOrder(b) ||
       String(a.scheduled_date || "").localeCompare(String(b.scheduled_date || "")) ||
-      (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9) ||
       (a.position ?? 0) - (b.position ?? 0)
   );
 }
@@ -586,9 +599,15 @@ async function scheduleCalendarTask(taskId, date) {
   if (!task) return;
   const nextDate = date || null;
   if ((task.scheduled_date || null) === nextDate) return;
+  const duration = taskDurationDays(task);
+  const nextEnd = nextDate ? addDaysKey(nextDate, duration - 1) : null;
 
   const previous = state.calendar;
-  const moved = { ...task, scheduled_date: nextDate };
+  const moved = {
+    ...task,
+    scheduled_date: nextDate,
+    scheduled_end_date: nextEnd === nextDate ? null : nextEnd,
+  };
   let scheduled = previous.scheduled.filter((item) => item.id !== taskId);
   let unscheduled = previous.unscheduled.filter((item) => item.id !== taskId);
   if (nextDate) {
@@ -600,9 +619,80 @@ async function scheduleCalendarTask(taskId, date) {
   calendar.render(state.calendar);
 
   try {
-    await api.updateTask(taskId, { scheduled_date: nextDate });
+    await api.updateTask(taskId, {
+      scheduled_date: nextDate,
+      scheduled_end_date: nextEnd === nextDate ? null : nextEnd,
+    });
   } catch (error) {
     toast(error?.message || "Не удалось изменить дату задачи", "error");
+    if (state.view === "calendar" && state.calendar) {
+      await refreshCalendarIfVisible();
+    }
+  }
+}
+
+async function resizeCalendarTask(taskId, endDate) {
+  if (state.view !== "calendar" || !state.calendar) return;
+  const task = findCalendarTask(taskId);
+  if (!task?.scheduled_date) return;
+  const nextEnd = endDate < task.scheduled_date ? task.scheduled_date : endDate;
+  const previous = state.calendar;
+  const changed = {
+    ...task,
+    scheduled_end_date: nextEnd === task.scheduled_date ? null : nextEnd,
+  };
+  state.calendar = {
+    ...previous,
+    scheduled: sortCalendarTasks(
+      previous.scheduled.map((item) => (item.id === taskId ? changed : item))
+    ),
+  };
+  calendar.render(state.calendar);
+
+  try {
+    await api.updateTask(taskId, {
+      scheduled_end_date: changed.scheduled_end_date,
+    });
+  } catch (error) {
+    toast(error?.message || "Не удалось растянуть задачу", "error");
+    if (state.view === "calendar" && state.calendar) {
+      await refreshCalendarIfVisible();
+    }
+  }
+}
+
+async function reorderCalendarTask(taskId, target) {
+  if (state.view !== "calendar" || !state.calendar) return;
+  const ordered = sortCalendarTasks(state.calendar.scheduled);
+  const index = ordered.findIndex((task) => task.id === taskId);
+  if (index < 0) return;
+
+  if (typeof target === "string") {
+    const next = index + (target === "up" ? -1 : 1);
+    if (next < 0 || next >= ordered.length) return;
+    [ordered[index], ordered[next]] = [ordered[next], ordered[index]];
+  } else if (target && typeof target === "object") {
+    const targetIndex = ordered.findIndex((task) => task.id === target.targetId);
+    if (targetIndex < 0 || target.targetId === taskId) return;
+    const [moved] = ordered.splice(index, 1);
+    let insertAt = ordered.findIndex((task) => task.id === target.targetId);
+    if (insertAt < 0) return;
+    if (!target.before) insertAt += 1;
+    ordered.splice(insertAt, 0, moved);
+  } else {
+    return;
+  }
+
+  ordered.forEach((task, position) => {
+    task.calendar_order = position;
+  });
+  state.calendar = { ...state.calendar, scheduled: ordered };
+  calendar.render(state.calendar);
+
+  try {
+    await api.reorderCalendar(ordered.map((task) => task.id));
+  } catch (error) {
+    toast(error?.message || "Не удалось изменить порядок задач", "error");
     if (state.view === "calendar" && state.calendar) {
       await refreshCalendarIfVisible();
     }
@@ -646,6 +736,7 @@ function openCalendarTaskEditor(taskId = null, date = null) {
           description: payload.description,
           status: payload.status,
           scheduled_date: payload.scheduled_date,
+          scheduled_end_date: payload.scheduled_end_date,
         });
         setProject(response.project);
         lastCalendarProjectId = task.project_id;
@@ -655,6 +746,7 @@ function openCalendarTaskEditor(taskId = null, date = null) {
           description: payload.description,
           status: payload.status,
           scheduled_date: payload.scheduled_date,
+          scheduled_end_date: payload.scheduled_end_date,
         });
         setProject(response.project);
         lastCalendarProjectId = payload.projectId;
@@ -802,10 +894,16 @@ async function reloadTasks(projectId = state.activeId) {
   }
 }
 
-async function saveTask({ id, title, description, status, scheduled_date }) {
+async function saveTask({ id, title, description, status, scheduled_date, scheduled_end_date }) {
   const projectId = state.activeId;
   if (!projectId) throw new Error("Проект не выбран");
-  const payload = { title, description, status, scheduled_date: scheduled_date || null };
+  const payload = {
+    title,
+    description,
+    status,
+    scheduled_date: scheduled_date || null,
+    scheduled_end_date: scheduled_end_date || null,
+  };
   const response = id
     ? await api.updateTask(id, payload)
     : await api.createTask(projectId, payload);
@@ -886,10 +984,158 @@ async function deleteMessage(id) {
 /* ------------------------------------------------------------------ */
 /* информация о базе                                                 */
 /* ------------------------------------------------------------------ */
+function syncProviderInfo(sync = state.info?.sync) {
+  const mode = sync?.mode || "folder";
+  if (mode === "drive" && sync?.drive?.connected) {
+    return { configured: true, label: "Google Drive API", remote: sync.remote || null };
+  }
+  if (mode === "yandex" && sync?.yandex?.connected) {
+    return { configured: true, label: "Яндекс Диск", remote: sync.remote || null };
+  }
+  if (mode === "folder" && sync?.folder) {
+    return { configured: true, label: "Папка Google Диска", remote: sync.remote || null };
+  }
+  return { configured: false, label: "Синхронизация не настроена", remote: null };
+}
+
+function renderQuickSync() {
+  if (!elements.syncVersionNumber) return;
+  const sync = state.info?.sync || {};
+  const provider = syncProviderInfo(sync);
+  const remote = provider.remote;
+  const last = sync.last_sync || {};
+  const version = remote?.version ?? last?.version ?? null;
+  const localWrite = state.info?.db?.last_write_at;
+  const hasLocalChanges = Boolean(
+    last.at && localWrite && Date.parse(localWrite) > Date.parse(last.at)
+  );
+
+  elements.quickSyncPush.disabled = !provider.configured || quickSyncBusy;
+  elements.quickSyncPull.disabled = !provider.configured || quickSyncBusy;
+  elements.syncVersionDot.classList.toggle(
+    "is-online",
+    provider.configured && Boolean(version) && !hasLocalChanges
+  );
+  elements.syncVersionDot.classList.toggle(
+    "is-warning",
+    provider.configured && (hasLocalChanges || !version)
+  );
+  elements.syncVersionMeta.classList.toggle("is-warning", hasLocalChanges);
+
+  if (!provider.configured) {
+    elements.syncVersionNumber.textContent = "—";
+    elements.syncVersionMeta.textContent = "Синхронизация не настроена";
+    elements.syncVersionCard.title = "Открыть настройки синхронизации";
+    return;
+  }
+
+  elements.syncVersionNumber.textContent = version ? `v${version}` : "—";
+  const device = remote?.device || last.device || "";
+  const place = `${provider.label}${device ? ` · ${device}` : ""}`;
+  if (hasLocalChanges) {
+    elements.syncVersionMeta.textContent = `${place} · есть изменения`;
+    elements.syncVersionCard.title = "Есть локальные изменения — отправьте их на Диск";
+  } else if (version) {
+    elements.syncVersionMeta.textContent = place;
+    elements.syncVersionCard.title = remote?.updated_at
+      ? `Версия на Диске: ${formatFullDate(remote.updated_at)}`
+      : "Открыть настройки синхронизации";
+  } else {
+    elements.syncVersionMeta.textContent = "На Диске пока нет версии";
+    elements.syncVersionCard.title = "Открыть настройки синхронизации";
+  }
+}
+
+async function refreshQuickSync({ refreshRemote = false } = {}) {
+  renderQuickSync();
+  if (!refreshRemote) return;
+  const provider = syncProviderInfo();
+  if (!provider.configured) return;
+  const request = ++quickSyncRemoteRequest;
+  try {
+    const sync = await api.syncStatus(true);
+    if (request !== quickSyncRemoteRequest) return;
+    state.info = { ...state.info, sync };
+    renderQuickSync();
+  } catch (error) {
+    /* последняя известная версия остаётся в виджете */
+  }
+}
+
+function setQuickSyncBusy(value) {
+  quickSyncBusy = value;
+  const pushLabel = elements.quickSyncPush.querySelector("span");
+  const pullLabel = elements.quickSyncPull.querySelector("span");
+  if (pushLabel) pushLabel.textContent = value ? "Отправляю…" : "На Диск";
+  if (pullLabel) pullLabel.textContent = value ? "Скачиваю…" : "Скачать";
+  renderQuickSync();
+}
+
+async function quickSyncSend() {
+  if (quickSyncBusy) return;
+  const sync = state.info?.sync;
+  const provider = syncProviderInfo(sync);
+  if (!provider.configured) {
+    openSettingsModal();
+    toast("Сначала настройте синхронизацию", "info");
+    return;
+  }
+  const confirmed = await confirmDialog({
+    title: "Отправить данные на Диск?",
+    message: `Текстовая база и файлы будут отправлены на ${provider.label}.`,
+    confirmLabel: "Отправить",
+    danger: false,
+  });
+  if (!confirmed) return;
+  setQuickSyncBusy(true);
+  try {
+    const result = await api.syncSend();
+    state.info = { ...state.info, sync: result.sync || state.info.sync };
+    toast("Данные отправлены на Диск", "success");
+    await refreshInfo();
+    await refreshQuickSync({ refreshRemote: true });
+  } catch (error) {
+    toast(error?.message || "Не удалось отправить данные", "error");
+  } finally {
+    setQuickSyncBusy(false);
+  }
+}
+
+async function quickSyncReceive() {
+  if (quickSyncBusy) return;
+  const sync = state.info?.sync;
+  const provider = syncProviderInfo(sync);
+  if (!provider.configured) {
+    openSettingsModal();
+    toast("Сначала настройте синхронизацию", "info");
+    return;
+  }
+  const version = sync?.remote?.version ?? sync?.last_sync?.version;
+  const confirmed = await confirmDialog({
+    title: "Скачать данные с Диска?",
+    message: version
+      ? `Локальная база и файлы будут заменены версией ${version} с Диска. Перед заменой будет создана резервная копия.`
+      : "Локальная база и файлы будут заменены версией с Диска. Перед заменой будет создана резервная копия.",
+    confirmLabel: "Скачать",
+    danger: true,
+  });
+  if (!confirmed) return;
+  setQuickSyncBusy(true);
+  try {
+    await api.syncReceive();
+    toast("Данные скачаны — перезагружаю Tasker", "success");
+    window.setTimeout(() => window.location.reload(), 500);
+  } catch (error) {
+    toast(error?.message || "Не удалось скачать данные", "error");
+    setQuickSyncBusy(false);
+  }
+}
+
 async function refreshInfo() {
   try {
     state.info = await api.info();
     renderSettingsSubtitle();
+    renderQuickSync();
   } catch (error) {
     /* размер не критичен */
   }
@@ -898,11 +1144,11 @@ async function refreshInfo() {
 function downloadBackup() {
   const link = document.createElement("a");
   link.href = api.backupDownloadUrl;
-  link.download = "tasker.db";
+  link.download = "tasker.zip";
   document.body.appendChild(link);
   link.click();
   link.remove();
-  toast("Файл базы выгружается — сохраните его в надёжном месте", "info");
+  toast("Архив базы и файлов выгружается — сохраните его в надёжном месте", "info");
 }
 
 function openSettingsModal() {
@@ -915,6 +1161,33 @@ function openSettingsModal() {
       const stats = info.stats || {};
       const preferences = info.preferences || state.preferences;
       applyCalendarPreferences(preferences);
+      const sync = info.sync || {};
+      const remote = sync.remote || null;
+      const lastSync = sync.last_sync || {};
+      const drive = sync.drive || {};
+      const yandex = sync.yandex || {};
+      const syncMode =
+        sync.mode === "drive" || sync.mode === "yandex" ? sync.mode : "folder";
+      const remoteText = syncMode === "drive"
+        ? drive.connected
+          ? "Google Drive API подключён"
+          : "Google Drive API не подключён"
+        : syncMode === "yandex"
+          ? yandex.connected
+            ? "Яндекс Диск подключён"
+            : "Яндекс Диск не подключён"
+          : remote
+            ? `На Диске: версия ${remote.version ?? "—"} · ${esc(remote.device || "—")} · ${
+                remote.updated_at ? esc(formatFullDate(remote.updated_at)) : "—"
+              }`
+            : sync.folder
+              ? "В выбранной папке пока нет данных Tasker"
+              : "Папка Google Диска не выбрана";
+      const lastText = lastSync.version
+        ? `Последняя синхронизация: версия ${lastSync.version} · ${esc(
+            lastSync.device || "—"
+          )} · ${lastSync.at ? esc(formatFullDate(lastSync.at)) : "—"}`
+        : "Синхронизация ещё не выполнялась";
       const savedAt = db.last_write_at || db.modified_at;
       const writable = Boolean(db.writable);
       const statusTitle = writable
@@ -967,6 +1240,77 @@ function openSettingsModal() {
             </span>
           </label>
         </div>
+        <div class="settings-sync-section">
+          <div class="db-section-label">Синхронизация</div>
+          <p class="settings-sync-hint">Можно использовать папку на компьютере, Google Drive API или Яндекс Диск. Обмен выполняется только по кнопкам.</p>
+          <label class="field settings-sync-field">
+            <span class="field-label">Способ синхронизации</span>
+            <select class="input" id="sync-mode">
+              <option value="folder" ${syncMode === "folder" ? "selected" : ""}>Папка Google Диска (Drive для компьютера)</option>
+              <option value="drive" ${syncMode === "drive" ? "selected" : ""}>Google Drive API (без приложения)</option>
+              <option value="yandex" ${syncMode === "yandex" ? "selected" : ""}>Яндекс Диск (токен)</option>
+            </select>
+          </label>
+          <div id="sync-folder-fields" ${syncMode === "folder" ? "" : "hidden"}>
+            <label class="field settings-sync-field">
+              <span class="field-label">Папка синхронизации</span>
+              <div class="db-path-input-row">
+                <input class="input" id="sync-folder" type="text" spellcheck="false"
+                       value="${esc(sync.folder || "")}" placeholder="Например, G:\\My Drive\\Tasker">
+                <button type="button" class="btn btn-ghost" data-act="sync-browse">Обзор…</button>
+              </div>
+            </label>
+          </div>
+          <div id="sync-drive-fields" ${syncMode === "drive" ? "" : "hidden"}>
+            <p class="settings-sync-hint">Создайте OAuth-клиент типа «Desktop app» в Google Cloud Console и включите Google Drive API. Нужен только scope drive.file.</p>
+            <label class="field settings-sync-field">
+              <span class="field-label">OAuth Client ID</span>
+              <input class="input" id="drive-client-id" type="text" spellcheck="false"
+                     value="${esc(drive.client_id || "")}" placeholder="....apps.googleusercontent.com">
+            </label>
+            <label class="field settings-sync-field">
+              <span class="field-label">OAuth Client Secret</span>
+              <input class="input" id="drive-client-secret" type="password" spellcheck="false"
+                     placeholder="${drive.client_secret_set ? "Сохранён — оставьте пустым" : "Вставьте Client Secret"}">
+            </label>
+            <div class="drive-auth-row">
+              <span class="drive-auth-status" id="drive-status">${drive.connected ? "Google Диск подключён" : "Google Диск не подключён"}</span>
+              <button type="button" class="btn btn-quiet btn-sm" data-act="drive-disconnect" ${drive.connected ? "" : "hidden"}>Отключить</button>
+              <button type="button" class="btn btn-primary btn-sm" data-act="drive-connect">Подключить</button>
+            </div>
+          </div>
+          <div id="sync-yandex-fields" ${syncMode === "yandex" ? "" : "hidden"}>
+            <p class="settings-sync-hint">Нужен OAuth-токен Яндекс ID с правами <code>cloud_api:disk.app_folder</code> и <code>cloud_api:disk.info</code>. Redirect URI приложения: <code>https://oauth.yandex.ru/verification_code</code>.</p>
+            <label class="field settings-sync-field">
+              <span class="field-label">OAuth-токен Яндекса</span>
+              <input class="input" id="yandex-token" type="password" spellcheck="false"
+                     placeholder="${yandex.token_set ? "Сохранён — оставьте пустым" : "Вставьте токен из Яндекс OAuth"}">
+            </label>
+            <div class="yandex-auth-row">
+              <span class="yandex-auth-status" id="yandex-status">${yandex.connected ? `Подключён${yandex.total_space ? ` · ${formatSize(yandex.used_space || 0)} из ${formatSize(yandex.total_space)}` : ""}` : "Яндекс Диск не подключён"}</span>
+              <button type="button" class="btn btn-quiet btn-sm" data-act="yandex-disconnect" ${yandex.connected ? "" : "hidden"}>Отключить</button>
+              <button type="button" class="btn btn-primary btn-sm" data-act="yandex-connect">Подключить</button>
+            </div>
+            <p class="db-meta">Файлы хранятся в папке приложения на Яндекс Диске; доступ к остальному Диску не нужен.</p>
+          </div>
+          <label class="field settings-sync-field">
+            <span class="field-label">Имя этого устройства</span>
+            <input class="input" id="sync-device" type="text" maxlength="80"
+                   value="${esc(sync.device_name || "")}">
+          </label>
+          <div class="sync-remote-state">
+            <span class="sync-remote-dot"></span>
+            <div>
+              <strong id="sync-remote-title">${remoteText}</strong>
+              <span id="sync-remote-last">${lastText}</span>
+            </div>
+          </div>
+          <div class="sync-actions">
+            <button type="button" class="btn btn-quiet" data-act="sync-receive">${icon("download")}<span>Скачать с Диска</span></button>
+            <button type="button" class="btn btn-primary" data-act="sync-send">${icon("database")}<span>Отправить на Диск</span></button>
+          </div>
+          <p class="db-meta">Сейчас синхронизируются текстовая база и папка файлов. Версия на Диске и автор показаны выше.</p>
+        </div>
         <div class="db-section">
           <div class="db-section-label">Текущая база</div>
           <div class="db-path-row">
@@ -1004,19 +1348,20 @@ function openSettingsModal() {
         </div>
         <div class="db-note">
           ${icon("database")}
-          <p>В этом файле лежит всё: проекты, задачи, заметки и вложения.
-          Для синхронизации копируйте файл при закрытом Tasker или сохраняйте резервную копию.</p>
+          <p>Текстовая база и папка файлов лежат рядом с файлом базы:
+          <code>${esc(db.files_dir || "")}</code>. Для резервной копии используйте
+          «Сохранить копию» или «Скачать архив» — они включают и базу, и файлы.</p>
         </div>`;
 
       const footer = `
         <button type="button" class="btn btn-quiet" data-act="folder">${icon("folder")}<span>Открыть папку</span></button>
         <button type="button" class="btn btn-quiet" data-act="backup">${icon("database")}<span>Сохранить копию</span></button>
         <span class="modal-footer-spacer"></span>
-        <button type="button" class="btn btn-primary" data-act="download">${icon("download")}<span>Скачать БД</span></button>`;
+        <button type="button" class="btn btn-primary" data-act="download">${icon("download")}<span>Скачать архив</span></button>`;
 
       openModal({
         title: "Настройки",
-        subtitle: "Календарь, проекты и файл базы данных",
+        subtitle: "Календарь, проекты, файлы и синхронизация",
         className: "modal-db modal-settings",
         body,
         footer,
@@ -1074,6 +1419,339 @@ function openSettingsModal() {
           showCompleted.addEventListener("change", savePreferences);
           showWeekends.addEventListener("change", savePreferences);
           sortProjects.addEventListener("change", savePreferences);
+
+          const syncModeInput = overlay.querySelector("#sync-mode");
+          const syncFolderInput = overlay.querySelector("#sync-folder");
+          const syncFolderFields = overlay.querySelector("#sync-folder-fields");
+          const syncDriveFields = overlay.querySelector("#sync-drive-fields");
+          const syncYandexFields = overlay.querySelector("#sync-yandex-fields");
+          const syncDeviceInput = overlay.querySelector("#sync-device");
+          const syncRemoteTitle = overlay.querySelector("#sync-remote-title");
+          const syncRemoteLast = overlay.querySelector("#sync-remote-last");
+          const syncBrowseButton = overlay.querySelector('[data-act="sync-browse"]');
+          const syncSendButton = overlay.querySelector('[data-act="sync-send"]');
+          const syncReceiveButton = overlay.querySelector('[data-act="sync-receive"]');
+          const driveClientId = overlay.querySelector("#drive-client-id");
+          const driveClientSecret = overlay.querySelector("#drive-client-secret");
+          const driveStatus = overlay.querySelector("#drive-status");
+          const driveConnectButton = overlay.querySelector('[data-act="drive-connect"]');
+          const driveDisconnectButton = overlay.querySelector('[data-act="drive-disconnect"]');
+          const yandexToken = overlay.querySelector("#yandex-token");
+          const yandexStatus = overlay.querySelector("#yandex-status");
+          const yandexConnectButton = overlay.querySelector('[data-act="yandex-connect"]');
+          const yandexDisconnectButton = overlay.querySelector('[data-act="yandex-disconnect"]');
+          let syncBusy = false;
+          let drivePollTimer = null;
+
+          const applySyncMode = () => {
+            const mode =
+              syncModeInput.value === "drive" || syncModeInput.value === "yandex"
+                ? syncModeInput.value
+                : "folder";
+            syncFolderFields.hidden = mode !== "folder";
+            syncDriveFields.hidden = mode !== "drive";
+            syncYandexFields.hidden = mode !== "yandex";
+          };
+
+          const applySyncState = (sync = {}) => {
+            state.info = { ...state.info, sync };
+            const remote = sync.remote;
+            const last = sync.last_sync || {};
+            const isDrive = sync.mode === "drive";
+            const isYandex = sync.mode === "yandex";
+            const drive = sync.drive || {};
+            const yandex = sync.yandex || {};
+            syncRemoteTitle.textContent = isDrive
+              ? drive.connected
+                ? "Google Drive API подключён"
+                : "Google Drive API не подключён"
+              : isYandex
+                ? yandex.connected
+                  ? "Яндекс Диск подключён"
+                  : "Яндекс Диск не подключён"
+                : remote
+                  ? `На Диске: версия ${remote.version ?? "—"} · ${remote.device || "—"} · ${
+                      remote.updated_at ? formatFullDate(remote.updated_at) : "—"
+                    }`
+                  : sync.folder
+                    ? "В выбранной папке пока нет данных Tasker"
+                    : "Папка Google Диска не выбрана";
+            syncRemoteLast.textContent = last.version
+              ? `Последняя синхронизация: версия ${last.version} · ${last.device || "—"} · ${
+                  last.at ? formatFullDate(last.at) : "—"
+                }`
+              : "Синхронизация ещё не выполнялась";
+            if (driveStatus) {
+              driveStatus.textContent = drive.connected
+                ? "Google Диск подключён"
+                : "Google Диск не подключён";
+              driveDisconnectButton.hidden = !drive.connected;
+            }
+            if (yandexStatus) {
+              yandexStatus.textContent = yandex.connected
+                ? `Подключён${
+                    yandex.total_space
+                      ? ` · ${formatSize(yandex.used_space || 0)} из ${formatSize(yandex.total_space)}`
+                      : ""
+                  }`
+                : "Яндекс Диск не подключён";
+              yandexDisconnectButton.hidden = !yandex.connected;
+            }
+            renderQuickSync();
+          };
+
+          syncModeInput.addEventListener("change", applySyncMode);
+
+          const persistSyncSettings = async () => {
+            const mode =
+              syncModeInput.value === "drive" || syncModeInput.value === "yandex"
+                ? syncModeInput.value
+                : "folder";
+            const folder = syncFolderInput.value.trim();
+            const deviceName = syncDeviceInput.value.trim();
+            if (mode === "folder" && !folder) {
+              toast("Сначала выберите папку Google Диска", "error");
+              syncFolderInput.focus();
+              return null;
+            }
+            const result = await api.saveSyncSettings(folder, deviceName, mode);
+            applySyncState(result.sync || {});
+            syncDeviceInput.value = state.info.sync?.device_name || deviceName;
+            if (mode === "drive") {
+              const clientId = driveClientId.value.trim();
+              const clientSecret = driveClientSecret.value.trim();
+              if (clientId) {
+                const driveResult = await api.saveDriveSettings(clientId, clientSecret);
+                applySyncState(driveResult.sync || {});
+                driveClientSecret.value = "";
+                driveClientSecret.placeholder = "Сохранён — оставьте пустым";
+              }
+            }
+            if (mode === "yandex") {
+              const token = yandexToken.value.trim();
+              if (token) {
+                const yandexResult = await api.yandexConnect(token);
+                applySyncState(yandexResult.sync || {});
+                yandexToken.value = "";
+                yandexToken.placeholder = "Сохранён — оставьте пустым";
+              }
+            }
+            return state.info.sync;
+          };
+
+          const setSyncBusy = (value) => {
+            syncBusy = value;
+            syncBrowseButton.disabled = value;
+            syncSendButton.disabled = value;
+            syncReceiveButton.disabled = value;
+            syncFolderInput.disabled = value;
+            syncDeviceInput.disabled = value;
+            syncModeInput.disabled = value;
+            driveClientId.disabled = value;
+            driveClientSecret.disabled = value;
+            driveConnectButton.disabled = value;
+            driveDisconnectButton.disabled = value;
+            yandexToken.disabled = value;
+            yandexConnectButton.disabled = value;
+            yandexDisconnectButton.disabled = value;
+          };
+
+          syncBrowseButton.addEventListener("click", async () => {
+            try {
+              const result = await api.browseSyncFolder();
+              if (result?.path) {
+                syncFolderInput.value = result.path;
+                await persistSyncSettings();
+              }
+            } catch (error) {
+              toast(error?.message || "Не удалось выбрать папку", "error");
+            }
+          });
+
+          driveConnectButton.addEventListener("click", async () => {
+            if (syncBusy) return;
+            const clientId = driveClientId.value.trim();
+            const clientSecret = driveClientSecret.value.trim();
+            if (!clientId) {
+              toast("Укажите OAuth Client ID", "error");
+              driveClientId.focus();
+              return;
+            }
+            setSyncBusy(true);
+            try {
+              await api.saveSyncSettings(
+                syncFolderInput.value.trim(),
+                syncDeviceInput.value.trim(),
+                "drive"
+              );
+              const result = await api.startDriveAuth(clientId, clientSecret);
+              driveClientSecret.value = "";
+              driveClientSecret.placeholder = "Сохранён — оставьте пустым";
+              driveStatus.textContent = "Ожидаю подтверждение в браузере…";
+              let attempts = 0;
+              if (drivePollTimer) window.clearInterval(drivePollTimer);
+              drivePollTimer = window.setInterval(async () => {
+                attempts += 1;
+                try {
+                  const sync = await api.syncStatus();
+                  applySyncState(sync);
+                  if (sync.drive?.connected) {
+                    window.clearInterval(drivePollTimer);
+                    drivePollTimer = null;
+                    toast("Google Диск подключён", "success");
+                  }
+                } catch (error) {
+                  /* продолжаем ждать */
+                }
+                if (attempts > 120) {
+                  window.clearInterval(drivePollTimer);
+                  drivePollTimer = null;
+                }
+              }, 1500);
+            } catch (error) {
+              toast(error?.message || "Не удалось начать подключение", "error");
+            } finally {
+              setSyncBusy(false);
+            }
+          });
+
+          driveDisconnectButton.addEventListener("click", async () => {
+            if (syncBusy) return;
+            setSyncBusy(true);
+            try {
+              const result = await api.disconnectDrive();
+              applySyncState(result.sync || {});
+              toast("Google Диск отключён", "success");
+            } catch (error) {
+              toast(error?.message || "Не удалось отключить Google Диск", "error");
+            } finally {
+              setSyncBusy(false);
+            }
+          });
+
+          yandexConnectButton.addEventListener("click", async () => {
+            if (syncBusy) return;
+            const token = yandexToken.value.trim();
+            if (!token && !state.info.sync?.yandex?.token_set) {
+              toast("Вставьте OAuth-токен Яндекс Диска", "error");
+              yandexToken.focus();
+              return;
+            }
+            setSyncBusy(true);
+            try {
+              await api.saveSyncSettings(
+                syncFolderInput.value.trim(),
+                syncDeviceInput.value.trim(),
+                "yandex"
+              );
+              const result = await api.yandexConnect(token);
+              applySyncState(result.sync || {});
+              yandexToken.value = "";
+              yandexToken.placeholder = "Сохранён — оставьте пустым";
+              toast("Яндекс Диск подключён", "success");
+            } catch (error) {
+              toast(error?.message || "Не удалось подключить Яндекс Диск", "error");
+            } finally {
+              setSyncBusy(false);
+            }
+          });
+
+          yandexDisconnectButton.addEventListener("click", async () => {
+            if (syncBusy) return;
+            setSyncBusy(true);
+            try {
+              const result = await api.yandexDisconnect();
+              applySyncState(result.sync || {});
+              yandexToken.value = "";
+              yandexToken.placeholder = "Вставьте токен из Яндекс OAuth";
+              toast("Яндекс Диск отключён", "success");
+            } catch (error) {
+              toast(error?.message || "Не удалось отключить Яндекс Диск", "error");
+            } finally {
+              setSyncBusy(false);
+            }
+          });
+
+          syncSendButton.addEventListener("click", async () => {
+            if (syncBusy) return;
+            try {
+              const sync = await persistSyncSettings();
+              if (!sync) return;
+              if (sync.mode === "drive" && !sync.drive?.connected) {
+                toast("Сначала подключите Google Диск", "error");
+                return;
+              }
+              if (sync.mode === "yandex" && !sync.yandex?.connected) {
+                toast("Сначала подключите Яндекс Диск", "error");
+                return;
+              }
+              const remote = sync.remote;
+              const targetName =
+                sync.mode === "yandex"
+                  ? "Яндекс Диск"
+                  : sync.mode === "drive"
+                    ? "Google Диск"
+                    : "папку Google Диска";
+              const confirmed = await confirmDialog({
+                title: "Отправить данные на Диск?",
+                message: remote
+                  ? `На Диске уже есть версия ${remote.version ?? "—"} (${remote.device || "—"}). Она будет заменена новой версией.`
+                  : `Текстовая база и папка файлов будут отправлены на ${targetName}.`,
+                confirmLabel: "Отправить",
+                danger: false,
+              });
+              if (!confirmed) return;
+              setSyncBusy(true);
+              syncSendButton.querySelector("span").textContent = "Отправляю…";
+              const result = await api.syncSend();
+              applySyncState(result.sync || {});
+              toast("Данные отправлены на Диск", "success");
+            } catch (error) {
+              toast(error?.message || "Не удалось отправить данные", "error");
+            } finally {
+              setSyncBusy(false);
+              syncSendButton.querySelector("span").textContent = "Отправить на Диск";
+            }
+          });
+
+          syncReceiveButton.addEventListener("click", async () => {
+            if (syncBusy) return;
+            try {
+              const sync = await persistSyncSettings();
+              if (!sync) return;
+              if (sync.mode === "folder" && !sync.remote) {
+                toast("В выбранной папке нет данных Tasker", "error");
+                return;
+              }
+              if (sync.mode === "drive" && !sync.drive?.connected) {
+                toast("Сначала подключите Google Диск", "error");
+                return;
+              }
+              if (sync.mode === "yandex" && !sync.yandex?.connected) {
+                toast("Сначала подключите Яндекс Диск", "error");
+                return;
+              }
+              const version = sync.remote?.version ?? sync.last_sync?.version ?? "—";
+              const confirmed = await confirmDialog({
+                title: "Скачать данные с Диска?",
+                message: `Локальная база и папка файлов будут заменены версией ${version} с Диска. Перед заменой будет создана резервная копия.`,
+                confirmLabel: "Скачать",
+                danger: true,
+              });
+              if (!confirmed) return;
+              setSyncBusy(true);
+              syncReceiveButton.querySelector("span").textContent = "Скачиваю…";
+              await api.syncReceive();
+              toast("Данные скачаны — перезагружаю Tasker", "success");
+              close();
+              window.setTimeout(() => window.location.reload(), 500);
+            } catch (error) {
+              toast(error?.message || "Не удалось скачать данные", "error");
+            } finally {
+              setSyncBusy(false);
+              syncReceiveButton.querySelector("span").textContent = "Скачать с Диска";
+            }
+          });
 
           const setBusy = (value) => {
             busy = value;
@@ -1550,6 +2228,9 @@ function bindEvents() {
 
   elements.themeBtn.addEventListener("click", toggleTheme);
   elements.dbPill.addEventListener("click", openSettingsModal);
+  elements.syncVersionCard.addEventListener("click", openSettingsModal);
+  elements.quickSyncPush.addEventListener("click", quickSyncSend);
+  elements.quickSyncPull.addEventListener("click", quickSyncReceive);
 
   document.getElementById("brand").addEventListener("click", (event) => {
     event.preventDefault();
@@ -1648,6 +2329,8 @@ async function init() {
       onToday: goCalendarToday,
       onModeChange: changeCalendarMode,
       onSchedule: scheduleCalendarTask,
+      onResize: resizeCalendarTask,
+      onReorder: reorderCalendarTask,
       onEditTask: (taskId) => openCalendarTaskEditor(taskId),
       onCreateTask: (date) => openCalendarTaskEditor(null, date),
     },
@@ -1663,6 +2346,8 @@ async function init() {
     applyCalendarPreferences(state.info?.preferences || state.preferences);
     renderSidebar();
     renderSettingsSubtitle();
+    renderQuickSync();
+    refreshQuickSync({ refreshRemote: true });
     showPendingFlash();
 
     const wantedCalendar = parseCalendarHash();

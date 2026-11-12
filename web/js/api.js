@@ -73,6 +73,8 @@ export const api = {
     const params = new URLSearchParams({ start, end });
     return request(`/api/calendar?${params}`);
   },
+  reorderCalendar: (ids) =>
+    request("/api/calendar/order", { method: "POST", body: { ids } }),
   createTask: (projectId, data) =>
     request(`/api/projects/${encodeURIComponent(projectId)}/tasks`, {
       method: "POST",
@@ -131,6 +133,33 @@ export const api = {
       method: "POST",
       body: preferences,
     }),
+  syncStatus: (refresh = false) =>
+    request(`/api/sync/status${refresh ? "?refresh=1" : ""}`),
+  saveSyncSettings: (folder, deviceName, mode = "folder") =>
+    request("/api/sync/folder", {
+      method: "POST",
+      body: { folder, device_name: deviceName, mode },
+    }),
+  browseSyncFolder: () =>
+    request("/api/sync/browse", { method: "POST", body: {} }),
+  saveDriveSettings: (clientId, clientSecret) =>
+    request("/api/drive/settings", {
+      method: "POST",
+      body: { client_id: clientId, client_secret: clientSecret },
+    }),
+  startDriveAuth: (clientId, clientSecret) =>
+    request("/api/drive/auth/start", {
+      method: "POST",
+      body: { client_id: clientId, client_secret: clientSecret },
+    }),
+  disconnectDrive: () =>
+    request("/api/drive/disconnect", { method: "POST", body: {} }),
+  yandexConnect: (token) =>
+    request("/api/yandex/connect", { method: "POST", body: { token } }),
+  yandexDisconnect: () =>
+    request("/api/yandex/disconnect", { method: "POST", body: {} }),
+  syncSend: () => request("/api/sync/send", { method: "POST", body: {} }),
+  syncReceive: () => request("/api/sync/receive", { method: "POST", body: {} }),
 
   attachmentUrl: (id, download = false) =>
     `/api/attachments/${encodeURIComponent(id)}${download ? "?download=1" : ""}`,

@@ -6,6 +6,7 @@ import {
   confirmDialog,
   toast,
 } from "./ui.js";
+import { addDaysKey, dateKey, taskDurationDays } from "./calendar.js";
 
 const STATUSES = [
   { id: "urgent", title: "Срочно" },
@@ -36,6 +37,7 @@ export function openTaskEditor({
   const status = task?.status || "urgent";
   const formId = "calendar-task-editor";
   const dateValue = task?.scheduled_date || defaultDate || "";
+  const endValue = task?.scheduled_end_date || "";
   const projectName = task?.project_name || selectedProject?.name || projectLabel;
   const projectColor =
     task?.project_color || selectedProject?.color || "#4c6ef5";
@@ -88,11 +90,32 @@ export function openTaskEditor({
         </div>
       </div>
       <div class="field">
-        <label class="field-label" for="calendar-task-date">Дата в календаре <span class="field-hint">необязательно</span></label>
-        <div class="date-input-row">
-          <input class="input" id="calendar-task-date" type="date" name="scheduled_date"
-                 value="${esc(dateValue)}">
-          <button type="button" class="btn btn-quiet btn-sm" data-act="clear-date">Убрать</button>
+        <span class="field-label">Даты в календаре <span class="field-hint">необязательно</span></span>
+        <div class="date-range-row">
+          <label class="date-range-field">
+            <span>Начало</span>
+            <input class="input" id="calendar-task-date" type="date" name="scheduled_date"
+                   value="${esc(dateValue)}">
+          </label>
+          <span class="date-range-dash" aria-hidden="true">—</span>
+          <label class="date-range-field">
+            <span>Конец</span>
+            <input class="input" id="calendar-task-end-date" type="date" name="scheduled_end_date"
+                   value="${esc(endValue)}">
+          </label>
+        </div>
+        <div class="duration-presets" role="group" aria-label="Длительность задачи">
+          <span class="duration-presets-label">Длительность:</span>
+          <button type="button" class="duration-chip" data-duration="1">1 день</button>
+          <button type="button" class="duration-chip" data-duration="2">2 дня</button>
+          <button type="button" class="duration-chip" data-duration="3">3 дня</button>
+          <button type="button" class="duration-chip" data-duration="4">4 дня</button>
+          <button type="button" class="duration-chip" data-duration="5">5 дней</button>
+          <button type="button" class="duration-chip" data-duration="6">6 дней</button>
+        </div>
+        <div class="date-range-row date-range-actions">
+          <span class="date-range-hint" id="calendar-task-duration">Один день</span>
+          <button type="button" class="btn btn-quiet btn-sm" data-act="clear-date">Убрать из календаря</button>
         </div>
       </div>
       ${
@@ -126,6 +149,9 @@ export function openTaskEditor({
       const form = overlay.querySelector(`#${formId}`);
       const titleInput = form.querySelector('[name="title"]');
       const dateInput = form.querySelector('[name="scheduled_date"]');
+      const endDateInput = form.querySelector('[name="scheduled_end_date"]');
+      const durationLabel = overlay.querySelector("#calendar-task-duration");
+      const durationButtons = [...overlay.querySelectorAll("[data-duration]")];
       const saveButton = overlay.querySelector('[data-act="save"]');
       const deleteButton = overlay.querySelector('[data-act="delete"]');
       let busy = false;
@@ -136,11 +162,62 @@ export function openTaskEditor({
         saveButton.textContent = value ? "Сохранение…" : "Сохранить";
       };
 
+      const updateDuration = () => {
+        endDateInput.min = dateInput.value || "";
+        const days = dateInput.value
+          ? taskDurationDays({
+              scheduled_date: dateInput.value,
+              scheduled_end_date: endDateInput.value || null,
+            })
+          : 0;
+        const invalid =
+          Boolean(dateInput.value) &&
+          Boolean(endDateInput.value) &&
+          endDateInput.value < dateInput.value;
+        durationLabel.textContent = invalid
+          ? "Конец раньше начала"
+          : !dateInput.value
+            ? "Без даты — задача будет в списке без даты"
+            : days === 1
+              ? "Один день"
+              : `${days} ${days < 5 ? "дня" : "дней"}`;
+        durationLabel.classList.toggle("is-invalid", invalid);
+        durationButtons.forEach((button) => {
+          button.classList.toggle(
+            "is-active",
+            Number(button.dataset.duration) === days
+          );
+        });
+      };
+
       titleInput.addEventListener("input", () => titleInput.classList.remove("is-invalid"));
+      dateInput.addEventListener("change", () => {
+        if (!dateInput.value) {
+          endDateInput.value = "";
+        } else if (endDateInput.value && endDateInput.value < dateInput.value) {
+          endDateInput.value = "";
+        }
+        updateDuration();
+      });
+      endDateInput.addEventListener("change", updateDuration);
+      durationButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const days = Number(button.dataset.duration);
+          if (!dateInput.value) {
+            dateInput.value = dateKey(new Date());
+          }
+          endDateInput.value =
+            days <= 1 ? "" : addDaysKey(dateInput.value, days - 1) || "";
+          updateDuration();
+        });
+      });
       overlay.querySelector('[data-act="clear-date"]').addEventListener("click", () => {
         dateInput.value = "";
+        endDateInput.value = "";
+        updateDuration();
         dateInput.focus();
       });
+      updateDuration();
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -157,6 +234,15 @@ export function openTaskEditor({
         const targetProjectId = isNew
           ? projectSelect?.value || projectId
           : task.project_id;
+        const startDate = dateInput.value || null;
+        let endDate = endDateInput.value || null;
+        if (!startDate) endDate = null;
+        if (startDate && endDate && endDate < startDate) {
+          toast("Дата окончания не может быть раньше даты начала", "error");
+          endDateInput.focus();
+          return;
+        }
+        if (endDate === startDate) endDate = null;
         setBusy(true);
         try {
           await onSave({
@@ -164,7 +250,8 @@ export function openTaskEditor({
             title,
             description: form.querySelector('[name="description"]').value,
             status: selected ? selected.value : status,
-            scheduled_date: dateInput.value || null,
+            scheduled_date: startDate,
+            scheduled_end_date: endDate,
           });
           close();
         } catch (error) {

@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import email.policy
+import html
 import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
+import webbrowser
 from datetime import date, datetime
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,15 +25,18 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import settings as app_settings
+from . import sync as app_sync
+from . import gdrive
+from . import yandex
 from .db import (
     Database,
     NotFoundError,
     ValidationError,
 )
-from .filedialog import choose_database_path
+from .filedialog import choose_database_path, choose_directory
 from .lifecycle import BrowserLifecycle
 
-VERSION = "1.7.0"
+VERSION = "1.11.0"
 
 MAX_JSON_BODY = 2 * 1024 * 1024
 MAX_UPLOAD_BODY = 120 * 1024 * 1024
@@ -122,6 +129,54 @@ class TaskerServer(ThreadingHTTPServer):
         self.calendar_preferences = app_settings.normalize_calendar(
             stored_settings.get("calendar")
         )
+        self.sync_folder = str(stored_settings.get("sync_folder") or "")
+        self.sync_mode = str(stored_settings.get("sync_mode") or "folder")
+        if self.sync_mode not in ("folder", "drive", "yandex"):
+            self.sync_mode = "folder"
+        self.device_name = str(
+            stored_settings.get("device_name") or socket.gethostname() or "Tasker"
+        )
+        self.last_sync = (
+            stored_settings.get("last_sync")
+            if isinstance(stored_settings.get("last_sync"), dict)
+            else {}
+        )
+        self.drive_client_id = str(stored_settings.get("drive_client_id") or "")
+        self.drive_client_secret = str(
+            stored_settings.get("drive_client_secret") or ""
+        )
+        self.drive_refresh_token = str(
+            stored_settings.get("drive_refresh_token") or ""
+        )
+        self.drive_access_token = str(
+            stored_settings.get("drive_access_token") or ""
+        )
+        try:
+            self.drive_token_expires = float(
+                stored_settings.get("drive_token_expires") or 0
+            )
+        except (TypeError, ValueError):
+            self.drive_token_expires = 0.0
+        self.drive_folder_id = str(
+            stored_settings.get("drive_folder_id") or ""
+        )
+        self.drive_files_id = str(stored_settings.get("drive_files_id") or "")
+        self.yandex_token = str(stored_settings.get("yandex_token") or "")
+        self.yandex_connected = bool(
+            stored_settings.get("yandex_connected") and self.yandex_token
+        )
+        self.yandex_total_space = int(
+            stored_settings.get("yandex_total_space") or 0
+        )
+        self.yandex_used_space = int(
+            stored_settings.get("yandex_used_space") or 0
+        )
+        self.yandex_trash_size = int(
+            stored_settings.get("yandex_trash_size") or 0
+        )
+        self.yandex_last_check = str(stored_settings.get("yandex_last_check") or "")
+        self.oauth_pending: dict[str, str] | None = None
+        self.sync_lock = threading.RLock()
         self.dialog_lock = threading.Lock()
         self.auto_shutdown = auto_shutdown
         super().__init__(address, TaskerHandler)
@@ -186,6 +241,8 @@ class TaskerHandler(BaseHTTPRequestHandler):
                 self._check_origin()
             parsed = urlsplit(self.path)
             path = unquote(parsed.path)
+            if path == "/oauth2callback" and method in ("GET", "HEAD"):
+                return self._oauth_callback(parse_qs(parsed.query))
             if not path.startswith("/api") or path == "/api":
                 if method not in ("GET", "HEAD"):
                     raise ApiError(405, "Метод не поддерживается")
@@ -231,11 +288,47 @@ class TaskerHandler(BaseHTTPRequestHandler):
         if segments == ["api", "settings", "calendar"] and method == "POST":
             return self._save_calendar_settings()
 
+        if segments == ["api", "sync", "status"] and method in ("GET", "HEAD"):
+            payload = self._sync_payload()
+            if query.get("refresh"):
+                self._refresh_remote_status(payload)
+            return self.send_json(200, payload)
+
+        if segments == ["api", "sync", "folder"] and method == "POST":
+            return self._save_sync_settings()
+
+        if segments == ["api", "sync", "browse"] and method == "POST":
+            return self._browse_sync_folder()
+
+        if segments == ["api", "sync", "send"] and method == "POST":
+            return self._sync_send()
+
+        if segments == ["api", "sync", "receive"] and method == "POST":
+            return self._sync_receive()
+
+        if segments == ["api", "drive", "settings"] and method == "POST":
+            return self._save_drive_settings()
+
+        if segments == ["api", "drive", "auth", "start"] and method == "POST":
+            return self._start_drive_auth()
+
+        if segments == ["api", "drive", "disconnect"] and method == "POST":
+            return self._disconnect_drive()
+
+        if segments == ["api", "yandex", "connect"] and method == "POST":
+            return self._connect_yandex()
+
+        if segments == ["api", "yandex", "disconnect"] and method == "POST":
+            return self._disconnect_yandex()
+
         if segments == ["api", "db", "browse"] and method == "POST":
             return self._browse_database()
 
         if segments == ["api", "db", "switch"] and method == "POST":
             return self._switch_database()
+
+        if segments == ["api", "calendar", "order"] and method == "POST":
+            return self._reorder_calendar()
 
         if segments == ["api", "calendar"] and method in ("GET", "HEAD"):
             start = self._date_param(query.get("start", [""])[0], "start")
@@ -323,6 +416,7 @@ class TaskerHandler(BaseHTTPRequestHandler):
                         data.get("description", ""),
                         data.get("status", "urgent"),
                         data.get("scheduled_date"),
+                        data.get("scheduled_end_date"),
                     )
                     return self.send_json(201, result)
             if resource == "messages":
@@ -341,7 +435,13 @@ class TaskerHandler(BaseHTTPRequestHandler):
             if method == "PATCH":
                 data = self._read_json()
                 kwargs = {}
-                for key in ("title", "description", "status", "scheduled_date"):
+                for key in (
+                    "title",
+                    "description",
+                    "status",
+                    "scheduled_date",
+                    "scheduled_end_date",
+                ):
                     if key in data:
                         kwargs[key] = data[key]
                 if not kwargs:
@@ -396,7 +496,70 @@ class TaskerHandler(BaseHTTPRequestHandler):
         info["db"]["config_path"] = str(self.server.settings_path)
         with self.server.preferences_lock:
             info["preferences"] = dict(self.server.calendar_preferences)
+        info["sync"] = self._sync_payload()
         return info
+
+    @staticmethod
+    def _remote_summary(manifest: dict | None) -> dict | None:
+        if not isinstance(manifest, dict):
+            return None
+        return {
+            key: manifest[key]
+            for key in ("version", "device", "updated_at", "sha256", "size", "schema")
+            if key in manifest
+        }
+
+    def _refresh_remote_status(self, payload: dict) -> None:
+        mode = self.server.sync_mode
+        if mode == "folder":
+            return
+        payload["remote"] = None
+        try:
+            manifest = None
+            if mode == "drive":
+                if not self.server.drive_refresh_token:
+                    return
+                with self.server.sync_lock:
+                    client = gdrive.DriveClient(self._drive_access_token())
+                    manifest = gdrive.remote_manifest(
+                        client, self.server.drive_folder_id or None
+                    )
+            elif mode == "yandex":
+                if not self.server.yandex_token:
+                    return
+                with self.server.sync_lock:
+                    manifest = yandex.remote_manifest(self.server.yandex_token)
+            payload["remote"] = self._remote_summary(manifest)
+        except ApiError as exc:
+            payload["remote_error"] = exc.message
+        except (gdrive.DriveError, yandex.YandexError, OSError) as exc:
+            payload["remote_error"] = str(exc)
+
+    def _sync_payload(self) -> dict:
+        payload = app_sync.status(self.server.sync_folder)
+        payload["mode"] = self.server.sync_mode
+        payload["device_name"] = self.server.device_name
+        payload["last_sync"] = dict(self.server.last_sync)
+        payload["drive"] = {
+            "connected": bool(self.server.drive_refresh_token),
+            "client_id": self.server.drive_client_id,
+            "client_secret_set": bool(self.server.drive_client_secret),
+            "folder_id": self.server.drive_folder_id,
+            "files_id": self.server.drive_files_id,
+        }
+        payload["yandex"] = {
+            "connected": bool(self.server.yandex_connected),
+            "token_set": bool(self.server.yandex_token),
+            "total_space": int(self.server.yandex_total_space),
+            "used_space": int(self.server.yandex_used_space),
+            "trash_size": int(self.server.yandex_trash_size),
+            "last_check": self.server.yandex_last_check,
+        }
+        payload["local"] = {
+            "db_version": self.server.db.info().get("version"),
+            "revision": self.server.db.info().get("db", {}).get("revision"),
+        }
+        return payload
 
     @staticmethod
     def _session_id(raw: object) -> str:
@@ -414,6 +577,7 @@ class TaskerHandler(BaseHTTPRequestHandler):
         )
 
     def _close_session(self, query: dict) -> None:
+        self._drain_body()
         raw = query.get("session_id", [""])[0]
         session_id = self._session_id(raw)
         self.server.lifecycle.close(session_id)
@@ -450,6 +614,12 @@ class TaskerHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
+    def _reorder_calendar(self) -> None:
+        data = self._read_json()
+        task_ids = data.get("ids")
+        self.server.db.reorder_calendar(task_ids)
+        return self.send_json(200, {"ok": True})
+
     def _save_calendar_settings(self) -> None:
         data = self._read_json()
         with self.server.preferences_lock:
@@ -472,7 +642,475 @@ class TaskerHandler(BaseHTTPRequestHandler):
             self.server.calendar_preferences = dict(preferences)
         return self.send_json(200, {"preferences": preferences})
 
+    def _save_sync_settings(self) -> None:
+        data = self._read_json()
+        folder = str(data.get("folder") or "").strip()
+        mode = str(data.get("mode") or self.server.sync_mode).strip()
+        if mode not in ("folder", "drive", "yandex"):
+            raise ApiError(400, "Неизвестный способ синхронизации")
+        device = " ".join(str(data.get("device_name") or "").split())[:80]
+        if folder:
+            try:
+                folder = str(Path(folder).expanduser().resolve())
+            except OSError as exc:
+                raise ApiError(400, f"Некорректный путь: {exc}") from exc
+            if Path(folder).exists() and not Path(folder).is_dir():
+                raise ApiError(400, "Выбрана папка синхронизации, но это файл")
+        if not device:
+            device = socket.gethostname() or "Tasker"
+        with self.server.sync_lock:
+            stored = app_settings.load(self.server.settings_path)
+            stored["sync_folder"] = folder
+            stored["sync_mode"] = mode
+            stored["device_name"] = device
+            app_settings.save(stored, self.server.settings_path)
+            self.server.sync_folder = folder
+            self.server.sync_mode = mode
+            self.server.device_name = device
+        return self.send_json(200, {"sync": self._sync_payload()})
+
+    def _browse_sync_folder(self) -> None:
+        self._drain_body()
+        try:
+            with self.server.dialog_lock:
+                selected = choose_directory(self.server.sync_folder or None)
+        except OSError as exc:
+            raise ApiError(501, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(500, f"Не удалось открыть диалог: {exc}") from exc
+        if not selected:
+            return self.send_json(200, {"cancelled": True})
+        return self.send_json(200, {"path": selected})
+
+    def _sync_send(self) -> None:
+        self._drain_body()
+        if self.server.sync_mode == "yandex":
+            return self._yandex_send()
+        if self.server.sync_mode == "drive":
+            return self._drive_send()
+        folder = self.server.sync_folder
+        if not folder:
+            raise ApiError(400, "Сначала выберите папку Google Диска")
+        try:
+            with self.server.sync_lock:
+                result = app_sync.send(
+                    self.server.db, folder, self.server.device_name
+                )
+                self._remember_sync(result.get("manifest") or {})
+        except ValidationError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except OSError as exc:
+            raise ApiError(500, f"Не удалось отправить данные: {exc}") from exc
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "folder": result.get("folder"),
+                "manifest": result.get("manifest"),
+                "sync": self._sync_payload(),
+            },
+        )
+
+    def _sync_receive(self) -> None:
+        self._drain_body()
+        if self.server.sync_mode == "yandex":
+            return self._yandex_receive()
+        if self.server.sync_mode == "drive":
+            return self._drive_receive()
+        folder = self.server.sync_folder
+        if not folder:
+            raise ApiError(400, "Сначала выберите папку Google Диска")
+        try:
+            with self.server.sync_lock:
+                result = app_sync.receive(self.server.db, folder)
+                self._remember_sync(result.get("manifest") or {})
+        except ValidationError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except OSError as exc:
+            raise ApiError(500, f"Не удалось скачать данные: {exc}") from exc
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "folder": result.get("folder"),
+                "manifest": result.get("manifest"),
+                "info": result.get("info"),
+                "sync": self._sync_payload(),
+            },
+        )
+
+    def _save_settings_fields(self, **fields) -> None:
+        stored = app_settings.load(self.server.settings_path)
+        stored.update(fields)
+        app_settings.save(stored, self.server.settings_path)
+
+    def _save_drive_settings(self) -> None:
+        data = self._read_json()
+        client_id = str(data.get("client_id") or "").strip()
+        client_secret = str(data.get("client_secret") or "").strip()
+        if not client_id:
+            raise ApiError(400, "Укажите OAuth Client ID")
+        if not client_secret:
+            client_secret = self.server.drive_client_secret
+        with self.server.sync_lock:
+            self._save_settings_fields(
+                sync_mode="drive",
+                drive_client_id=client_id,
+                drive_client_secret=client_secret,
+            )
+            self.server.sync_mode = "drive"
+            self.server.drive_client_id = client_id
+            self.server.drive_client_secret = client_secret
+        return self.send_json(200, {"sync": self._sync_payload()})
+
+    def _start_drive_auth(self) -> None:
+        data = self._read_json()
+        client_id = str(data.get("client_id") or self.server.drive_client_id).strip()
+        client_secret = str(
+            data.get("client_secret") or self.server.drive_client_secret
+        ).strip()
+        if not client_id:
+            raise ApiError(400, "Укажите OAuth Client ID из Google Cloud Console")
+        redirect_uri = f"http://127.0.0.1:{self.server.server_address[1]}/oauth2callback"
+        state = secrets.token_urlsafe(32)
+        verifier = gdrive.make_verifier()
+        with self.server.sync_lock:
+            self._save_settings_fields(
+                sync_mode="drive",
+                drive_client_id=client_id,
+                drive_client_secret=client_secret,
+                drive_refresh_token="",
+                drive_access_token="",
+                drive_token_expires=0,
+                drive_folder_id="",
+                drive_files_id="",
+            )
+            self.server.sync_mode = "drive"
+            self.server.drive_client_id = client_id
+            self.server.drive_client_secret = client_secret
+            self.server.drive_refresh_token = ""
+            self.server.drive_access_token = ""
+            self.server.drive_token_expires = 0.0
+            self.server.drive_folder_id = ""
+            self.server.drive_files_id = ""
+            self.server.oauth_pending = {
+                "state": state,
+                "verifier": verifier,
+                "redirect_uri": redirect_uri,
+            }
+        url = gdrive.auth_url(client_id, redirect_uri, state, verifier)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        return self.send_json(
+            200,
+            {
+                "url": url,
+                "redirect_uri": redirect_uri,
+            },
+        )
+
+    def _oauth_callback(self, query: dict) -> None:
+        error = query.get("error", [""])[0]
+        if error:
+            return self._send_html(
+                "Не удалось подключить Google Диск",
+                "Доступ не был предоставлен. Закройте окно и попробуйте снова.",
+            )
+        state = query.get("state", [""])[0]
+        code = query.get("code", [""])[0]
+        pending = self.server.oauth_pending
+        if not pending or not state or not secrets.compare_digest(
+            str(pending.get("state", "")), state
+        ):
+            return self._send_html(
+                "Ошибка подключения",
+                "Сессия авторизации устарела. Начните подключение заново.",
+            )
+        try:
+            tokens = gdrive.exchange_code(
+                self.server.drive_client_id,
+                self.server.drive_client_secret,
+                code,
+                pending["redirect_uri"],
+                pending["verifier"],
+            )
+        except gdrive.DriveError as exc:
+            return self._send_html("Ошибка Google", str(exc))
+        refresh_token = tokens.get("refresh_token") or self.server.drive_refresh_token
+        access_token = tokens.get("access_token", "")
+        expires = time.time() + int(tokens.get("expires_in", 3600)) - 60
+        with self.server.sync_lock:
+            self._save_settings_fields(
+                drive_refresh_token=refresh_token,
+                drive_access_token=access_token,
+                drive_token_expires=expires,
+                drive_folder_id="",
+                drive_files_id="",
+            )
+            self.server.drive_refresh_token = refresh_token
+            self.server.drive_access_token = access_token
+            self.server.drive_token_expires = expires
+            self.server.drive_folder_id = ""
+            self.server.drive_files_id = ""
+            self.server.oauth_pending = None
+        return self._send_html(
+            "Google Диск подключён",
+            "Можно закрыть это окно и вернуться в Tasker.",
+        )
+
+    def _disconnect_drive(self) -> None:
+        self._drain_body()
+        with self.server.sync_lock:
+            self._save_settings_fields(
+                drive_refresh_token="",
+                drive_access_token="",
+                drive_token_expires=0,
+                drive_folder_id="",
+                drive_files_id="",
+            )
+            self.server.drive_refresh_token = ""
+            self.server.drive_access_token = ""
+            self.server.drive_token_expires = 0.0
+            self.server.drive_folder_id = ""
+            self.server.drive_files_id = ""
+        return self.send_json(200, {"sync": self._sync_payload()})
+
+    def _drive_access_token(self) -> str:
+        if self.server.drive_access_token and self.server.drive_token_expires > time.time() + 60:
+            return self.server.drive_access_token
+        if not self.server.drive_refresh_token:
+            raise ApiError(401, "Сначала подключите Google Диск")
+        try:
+            tokens = gdrive.refresh_access_token(
+                self.server.drive_client_id,
+                self.server.drive_client_secret,
+                self.server.drive_refresh_token,
+            )
+        except gdrive.DriveError as exc:
+            raise ApiError(401, f"Не удалось обновить доступ: {exc}") from exc
+        access = tokens.get("access_token", "")
+        expires = time.time() + int(tokens.get("expires_in", 3600)) - 60
+        with self.server.sync_lock:
+            self._save_settings_fields(
+                drive_access_token=access,
+                drive_token_expires=expires,
+            )
+            self.server.drive_access_token = access
+            self.server.drive_token_expires = expires
+        return access
+
+    def _drive_client(self) -> gdrive.DriveClient:
+        return gdrive.DriveClient(self._drive_access_token())
+
+    def _drive_send(self) -> None:
+        try:
+            with self.server.sync_lock:
+                client = self._drive_client()
+                folder_id, files_id = gdrive.ensure_folders(
+                    client,
+                    self.server.drive_folder_id,
+                    self.server.drive_files_id,
+                )
+                result = gdrive.send(
+                    self.server.db,
+                    client,
+                    folder_id,
+                    files_id,
+                    self.server.device_name,
+                )
+                self.server.drive_folder_id = folder_id
+                self.server.drive_files_id = files_id
+                self._save_settings_fields(
+                    drive_folder_id=folder_id, drive_files_id=files_id
+                )
+                self._remember_sync(result.get("manifest") or {})
+        except gdrive.AuthRequired as exc:
+            raise ApiError(401, str(exc)) from exc
+        except gdrive.DriveError as exc:
+            raise ApiError(502, f"Google Drive: {exc}") from exc
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "provider": "drive",
+                "manifest": result.get("manifest"),
+                "sync": self._sync_payload(),
+            },
+        )
+
+    def _drive_receive(self) -> None:
+        try:
+            with self.server.sync_lock:
+                client = self._drive_client()
+                folder_id = self.server.drive_folder_id
+                if not folder_id:
+                    root = gdrive.find_root(client)
+                    folder_id = root["id"] if root else ""
+                if not folder_id:
+                    raise gdrive.DriveError("Папка Tasker на Google Диске не найдена")
+                result = gdrive.receive(self.server.db, client, folder_id)
+                self.server.drive_folder_id = folder_id
+                files_id = (result.get("manifest") or {}).get("files_id") or ""
+                if files_id:
+                    self.server.drive_files_id = files_id
+                self._save_settings_fields(
+                    drive_folder_id=folder_id,
+                    drive_files_id=self.server.drive_files_id,
+                )
+                self._remember_sync(result.get("manifest") or {})
+        except gdrive.AuthRequired as exc:
+            raise ApiError(401, str(exc)) from exc
+        except gdrive.DriveError as exc:
+            raise ApiError(502, f"Google Drive: {exc}") from exc
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "provider": "drive",
+                "manifest": result.get("manifest"),
+                "info": result.get("info"),
+                "sync": self._sync_payload(),
+            },
+        )
+
+    def _connect_yandex(self) -> None:
+        data = self._read_json()
+        token = str(data.get("token") or "").strip()
+        if not token:
+            token = self.server.yandex_token
+        if not token:
+            raise ApiError(400, "Вставьте OAuth-токен Яндекс Диска")
+        try:
+            client = yandex.YandexClient(token)
+            try:
+                info = client.disk_info()
+            except yandex.AuthRequired:
+                raise
+            except yandex.YandexError:
+                info = {}
+            client.ensure_folder(yandex.FILES_PATH)
+        except yandex.AuthRequired as exc:
+            raise ApiError(401, str(exc)) from exc
+        except yandex.YandexError as exc:
+            raise ApiError(502, f"Яндекс Диск: {exc}") from exc
+        checked_at = datetime.now().isoformat(timespec="seconds")
+        with self.server.sync_lock:
+            self._save_settings_fields(
+                sync_mode="yandex",
+                yandex_token=token,
+                yandex_connected=True,
+                yandex_total_space=int(info.get("total_space") or 0),
+                yandex_used_space=int(info.get("used_space") or 0),
+                yandex_trash_size=int(info.get("trash_size") or 0),
+                yandex_last_check=checked_at,
+            )
+            self.server.sync_mode = "yandex"
+            self.server.yandex_token = token
+            self.server.yandex_connected = True
+            self.server.yandex_total_space = int(info.get("total_space") or 0)
+            self.server.yandex_used_space = int(info.get("used_space") or 0)
+            self.server.yandex_trash_size = int(info.get("trash_size") or 0)
+            self.server.yandex_last_check = checked_at
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "yandex": {
+                    "total_space": self.server.yandex_total_space,
+                    "used_space": self.server.yandex_used_space,
+                    "trash_size": self.server.yandex_trash_size,
+                },
+                "sync": self._sync_payload(),
+            },
+        )
+
+    def _disconnect_yandex(self) -> None:
+        self._drain_body()
+        with self.server.sync_lock:
+            self._save_settings_fields(
+                yandex_token="",
+                yandex_connected=False,
+                yandex_total_space=0,
+                yandex_used_space=0,
+                yandex_trash_size=0,
+                yandex_last_check="",
+            )
+            self.server.yandex_token = ""
+            self.server.yandex_connected = False
+            self.server.yandex_total_space = 0
+            self.server.yandex_used_space = 0
+            self.server.yandex_trash_size = 0
+            self.server.yandex_last_check = ""
+        return self.send_json(200, {"sync": self._sync_payload()})
+
+    def _require_yandex_token(self) -> str:
+        if not self.server.yandex_token:
+            raise ApiError(401, "Сначала подключите Яндекс Диск")
+        return self.server.yandex_token
+
+    def _yandex_send(self) -> None:
+        try:
+            with self.server.sync_lock:
+                token = self._require_yandex_token()
+                result = yandex.send(
+                    self.server.db, token, self.server.device_name
+                )
+                self._remember_sync(result.get("manifest") or {})
+        except yandex.AuthRequired as exc:
+            raise ApiError(401, str(exc)) from exc
+        except yandex.YandexError as exc:
+            raise ApiError(502, f"Яндекс Диск: {exc}") from exc
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "provider": "yandex",
+                "manifest": result.get("manifest"),
+                "sync": self._sync_payload(),
+            },
+        )
+
+    def _yandex_receive(self) -> None:
+        try:
+            with self.server.sync_lock:
+                token = self._require_yandex_token()
+                result = yandex.receive(self.server.db, token)
+                self._remember_sync(result.get("manifest") or {})
+        except yandex.AuthRequired as exc:
+            raise ApiError(401, str(exc)) from exc
+        except yandex.YandexError as exc:
+            raise ApiError(502, f"Яндекс Диск: {exc}") from exc
+        return self.send_json(
+            200,
+            {
+                "ok": True,
+                "provider": "yandex",
+                "manifest": result.get("manifest"),
+                "info": result.get("info"),
+                "sync": self._sync_payload(),
+            },
+        )
+
+    def _remember_sync(self, manifest: dict) -> None:
+        self.server.last_sync = {
+            "version": manifest.get("version"),
+            "device": manifest.get("device"),
+            "at": manifest.get("updated_at"),
+            "sha256": manifest.get("sha256"),
+        }
+        stored = app_settings.load(self.server.settings_path)
+        stored["sync_folder"] = self.server.sync_folder
+        stored["sync_mode"] = self.server.sync_mode
+        stored["device_name"] = self.server.device_name
+        stored["last_sync"] = self.server.last_sync
+        stored["drive_folder_id"] = self.server.drive_folder_id
+        stored["drive_files_id"] = self.server.drive_files_id
+        app_settings.save(stored, self.server.settings_path)
+
     def _browse_database(self) -> None:
+        self._drain_body()
         try:
             with self.server.dialog_lock:
                 selected = choose_database_path(str(self.server.db.path))
@@ -613,20 +1251,20 @@ class TaskerHandler(BaseHTTPRequestHandler):
 
     def _download_snapshot(self) -> None:
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        filename = f"tasker-{stamp}.db"
-        with tempfile.TemporaryDirectory(prefix="tasker-snapshot-") as tmp:
-            snapshot = Path(tmp) / "tasker.db"
-            self.server.db.backup_to(snapshot)
-            size = snapshot.stat().st_size
+        filename = f"tasker-{stamp}.zip"
+        with tempfile.TemporaryDirectory(prefix="tasker-archive-") as tmp:
+            archive = Path(tmp) / "tasker.zip"
+            self.server.db.backup_archive_to(archive)
+            size = archive.stat().st_size
             self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Length", str(size))
             self.send_header("Content-Disposition", _disposition("attachment", filename))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             if self.command != "HEAD":
-                with snapshot.open("rb") as handle:
+                with archive.open("rb") as handle:
                     shutil.copyfileobj(handle, self.wfile, 256 * 1024)
 
     def _open_data_folder(self) -> None:
@@ -713,6 +1351,31 @@ class TaskerHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _send_html(self, title: str, message: str) -> None:
+        body = f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+body {{ font-family: system-ui, sans-serif; background:#f4f2eb; color:#211f1a;
+display:grid; place-items:center; min-height:100vh; margin:0; }}
+main {{ max-width:520px; padding:28px; background:#fff; border:1px solid #e6e2d7;
+border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,.08); }}
+h1 {{ font-size:20px; margin:0 0 10px; }}
+p {{ margin:0; color:#4b473e; line-height:1.6; }}
+</style></head>
+<body><main><h1>{html.escape(title)}</h1><p>{html.escape(message)}</p></main></body></html>"""
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     def _send_error_json(self, status: int, message: str) -> None:
         if status >= 400:
             # Тело запроса могло остаться непрочитанным — не пытаемся
@@ -783,6 +1446,23 @@ class TaskerHandler(BaseHTTPRequestHandler):
         if len(data) != length:
             raise ApiError(400, "Некорректный запрос")
         return data
+
+    def _drain_body(self) -> None:
+        """Прочитать тело POST, которое обработчику не нужно."""
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > MAX_JSON_BODY:
+            self.close_connection = True
+            return
+        try:
+            self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
 
     def _read_json(self) -> dict:
         content_type = self.headers.get("Content-Type", "")

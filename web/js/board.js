@@ -8,6 +8,7 @@ import {
   confirmDialog,
   toast,
 } from "./ui.js";
+import { taskDurationDays } from "./calendar.js";
 
 const COLUMNS = [
   { id: "urgent", title: "Срочно", hint: "Сделать как можно скорее" },
@@ -63,9 +64,17 @@ export function createBoard({ container, callbacks }) {
           </time>
           ${
             task.scheduled_date
-              ? `<span class="task-scheduled" title="В календаре: ${esc(formatDateOnly(task.scheduled_date, "full"))}">
-                   ${icon("calendar")} ${esc(formatDateOnly(task.scheduled_date))}
-                 </span>`
+              ? (() => {
+                  const days = taskDurationDays(task);
+                  const range = task.scheduled_end_date
+                    ? `${formatDateOnly(task.scheduled_date)}–${formatDateOnly(task.scheduled_end_date)}`
+                    : formatDateOnly(task.scheduled_date);
+                  return `<span class="task-scheduled" title="В календаре: ${esc(
+                    formatDateOnly(task.scheduled_date, "full")
+                  )}${days > 1 ? ` — ${days} дн.` : ""}">
+                   ${icon("calendar")} ${esc(range)}${days > 1 ? ` · ${days} дн.` : ""}
+                 </span>`;
+                })()
               : ""
           }
         </footer>
@@ -160,11 +169,23 @@ export function createBoard({ container, callbacks }) {
                     placeholder="Детали, ссылки, критерии готовности…">${esc(task?.description || "")}</textarea>
         </label>
         <div class="field">
-          <label class="field-label" for="task-scheduled-date">Дата в календаре <span class="field-hint">необязательно</span></label>
-          <div class="date-input-row">
-            <input class="input" id="task-scheduled-date" type="date" name="scheduled_date"
-                   value="${esc(task?.scheduled_date || "")}">
-            <button type="button" class="btn btn-quiet btn-sm" data-act="clear-date">Убрать</button>
+          <span class="field-label">Даты в календаре <span class="field-hint">необязательно</span></span>
+          <div class="date-range-row">
+            <label class="date-range-field">
+              <span>Начало</span>
+              <input class="input" id="task-scheduled-date" type="date" name="scheduled_date"
+                     value="${esc(task?.scheduled_date || "")}">
+            </label>
+            <span class="date-range-dash" aria-hidden="true">—</span>
+            <label class="date-range-field">
+              <span>Конец</span>
+              <input class="input" id="task-scheduled-end-date" type="date" name="scheduled_end_date"
+                     value="${esc(task?.scheduled_end_date || "")}">
+            </label>
+          </div>
+          <div class="date-range-row date-range-actions">
+            <span class="date-range-hint" id="task-duration">Один день</span>
+            <button type="button" class="btn btn-quiet btn-sm" data-act="clear-date">Убрать из календаря</button>
           </div>
         </div>
         <fieldset class="field field-inline">
@@ -212,6 +233,8 @@ export function createBoard({ container, callbacks }) {
         const form = overlay.querySelector(`#${formId}`);
         const titleInput = form.querySelector('[name="title"]');
         const dateInput = form.querySelector('[name="scheduled_date"]');
+        const endDateInput = form.querySelector('[name="scheduled_end_date"]');
+        const durationLabel = overlay.querySelector("#task-duration");
         const saveButton = overlay.querySelector('[data-act="save"]');
         const deleteButton = overlay.querySelector('[data-act="delete"]');
         let busy = false;
@@ -222,11 +245,45 @@ export function createBoard({ container, callbacks }) {
           saveButton.textContent = value ? "Сохранение…" : "Сохранить";
         };
 
+        const updateDuration = () => {
+          endDateInput.min = dateInput.value || "";
+          const days = dateInput.value
+            ? taskDurationDays({
+                scheduled_date: dateInput.value,
+                scheduled_end_date: endDateInput.value || null,
+              })
+            : 0;
+          const invalid =
+            Boolean(dateInput.value) &&
+            Boolean(endDateInput.value) &&
+            endDateInput.value < dateInput.value;
+          durationLabel.textContent = invalid
+            ? "Конец раньше начала"
+            : !dateInput.value
+              ? "Без даты"
+              : days === 1
+                ? "Один день"
+                : `${days} ${days < 5 ? "дня" : "дней"}`;
+          durationLabel.classList.toggle("is-invalid", invalid);
+        };
+
         titleInput.addEventListener("input", () => titleInput.classList.remove("is-invalid"));
+        dateInput.addEventListener("change", () => {
+          if (!dateInput.value) {
+            endDateInput.value = "";
+          } else if (endDateInput.value && endDateInput.value < dateInput.value) {
+            endDateInput.value = "";
+          }
+          updateDuration();
+        });
+        endDateInput.addEventListener("change", updateDuration);
         overlay.querySelector('[data-act="clear-date"]').addEventListener("click", () => {
           dateInput.value = "";
+          endDateInput.value = "";
+          updateDuration();
           dateInput.focus();
         });
+        updateDuration();
 
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
@@ -240,6 +297,15 @@ export function createBoard({ container, callbacks }) {
           }
           const description = form.querySelector('[name="description"]').value;
           const selected = form.querySelector('input[name="status"]:checked');
+          const startDate = dateInput.value || null;
+          let endDate = endDateInput.value || null;
+          if (!startDate) endDate = null;
+          if (startDate && endDate && endDate < startDate) {
+            toast("Дата окончания не может быть раньше даты начала", "error");
+            endDateInput.focus();
+            return;
+          }
+          if (endDate === startDate) endDate = null;
           setBusy(true);
           try {
             await callbacks.saveTask({
@@ -247,7 +313,8 @@ export function createBoard({ container, callbacks }) {
               title,
               description,
               status: selected ? selected.value : status,
-              scheduled_date: dateInput.value || null,
+              scheduled_date: startDate,
+              scheduled_end_date: endDate,
             });
             close();
           } catch (error) {

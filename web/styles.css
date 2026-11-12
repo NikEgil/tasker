@@ -2503,6 +2503,10 @@ body.is-resizing-chat * {
   background: var(--accent-soft);
 }
 
+.calendar-day.has-span-next {
+  border-right: 0;
+}
+
 .calendar-day.is-drop-target {
   z-index: 2;
   background: var(--accent-soft);
@@ -2688,6 +2692,166 @@ body.is-resizing-chat * {
 
 .calendar-task.is-inbox-task .calendar-task-project {
   font-size: 9px;
+}
+
+/* Задача, растянутая на несколько дней: сегменты соединяются в полосу. */
+.calendar-task.is-span {
+  margin-right: -6px;
+  margin-left: -5px;
+  border-radius: 0;
+}
+
+.calendar-task.is-span-start {
+  border-radius: 7px 0 0 7px;
+  border-right-color: transparent;
+}
+
+.calendar-task.is-span-middle {
+  border-right-color: transparent;
+  border-left-color: transparent;
+}
+
+.calendar-task.is-span-end {
+  border-radius: 0 7px 7px 0;
+  border-left-color: transparent;
+}
+
+.calendar-task.is-span-middle .calendar-task-dot {
+  opacity: 0.45;
+}
+
+.calendar-task.is-span .calendar-task-project {
+  color: color-mix(in srgb, var(--task-color, var(--accent)) 72%, var(--muted));
+}
+
+.calendar-task-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 15px;
+  height: 15px;
+  border-radius: 0 0 6px 0;
+  background:
+    linear-gradient(135deg, transparent 48%, color-mix(in srgb, var(--task-color, var(--accent)) 72%, var(--text)) 50%)
+    right bottom / 9px 9px no-repeat;
+  cursor: ew-resize;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.calendar-task:hover .calendar-task-resize,
+.calendar-task-resize:focus-visible {
+  opacity: 0.8;
+}
+
+.calendar-task.is-span-end .calendar-task-resize {
+  opacity: 0.4;
+}
+
+.calendar-task:hover .calendar-task-resize,
+.calendar-task.is-span-end:hover .calendar-task-resize,
+.calendar-task-resize:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .calendar-task-resize {
+    opacity: 0.65;
+  }
+}
+
+/* Диапазон дат в редакторе задачи. */
+.date-range-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 640px) {
+  .date-range-row {
+    flex-wrap: wrap;
+  }
+
+  .date-range-field {
+    flex-basis: 100%;
+  }
+
+  .date-range-dash {
+    display: none;
+  }
+}
+
+.date-range-field {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.date-range-field .input {
+  width: 100%;
+  min-width: 0;
+}
+
+.date-range-dash {
+  padding-bottom: 8px;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.date-range-actions {
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+}
+
+.date-range-hint {
+  color: var(--muted);
+  font-size: 9.5px;
+}
+
+.date-range-hint.is-invalid {
+  color: var(--danger);
+}
+
+.duration-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 7px;
+}
+
+.duration-presets-label {
+  margin-right: 2px;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.duration-chip {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.duration-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.duration-chip.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-weight: 650;
 }
 
 .calendar-loading {
@@ -3089,10 +3253,100 @@ legend.field-label {
 }
 
 .settings-calendar-section,
-.settings-projects-section {
+.settings-projects-section,
+.settings-sync-section {
   margin-bottom: 18px;
   padding-bottom: 16px;
   border-bottom: 1px solid var(--border);
+}
+
+.settings-sync-hint {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.settings-sync-field {
+  margin-top: 9px;
+}
+
+.sync-remote-state {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+
+.sync-remote-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin-top: 3px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.sync-remote-state > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.sync-remote-state strong {
+  color: var(--text);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.sync-remote-state span:last-child {
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.sync-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.drive-auth-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.drive-auth-status {
+  flex: 1;
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.yandex-auth-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.yandex-auth-status {
+  flex: 1;
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.45;
 }
 
 .settings-check {
@@ -4080,5 +4334,356 @@ legend.field-label {
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Календарь: дорожки задач, как блоки в тетрисе                       */
+/* ------------------------------------------------------------------ */
+.calendar-grid {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.calendar-week {
+  position: relative;
+  display: grid;
+  flex: 1 0 auto;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-rows: 24px repeat(var(--calendar-tracks, 0), 30px) minmax(0, 1fr);
+  min-height: 110px;
+}
+
+.calendar-week.is-no-weekends {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.calendar-board.is-week-view .calendar-week {
+  flex: 1 1 0;
+  min-height: 0;
+  grid-template-rows: 0 repeat(var(--calendar-tracks, 0), 30px) minmax(0, 1fr);
+}
+
+.calendar-day {
+  position: relative;
+  z-index: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  min-height: 0;
+  padding: 5px;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.calendar-day.is-last-column {
+  border-right: 0;
+}
+
+.calendar-week:last-child .calendar-day {
+  border-bottom: 0;
+}
+
+.calendar-week .calendar-day-head {
+  min-height: 16px;
+  height: 16px;
+}
+
+.calendar-week .calendar-task {
+  align-self: center;
+  height: 28px;
+  min-height: 28px;
+  margin: 1px 3px;
+  padding: 3px 6px;
+  gap: 4px;
+  overflow: hidden;
+  border-radius: 5px;
+  cursor: grab;
+}
+
+.calendar-week .calendar-task.is-span {
+  margin-right: 3px;
+  margin-left: 3px;
+  border-radius: 5px;
+}
+
+.calendar-week .calendar-task.is-continued-start {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.calendar-week .calendar-task.is-continued-end {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.calendar-week .calendar-task-title {
+  display: block;
+  overflow: hidden;
+  font-size: 9.5px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-line-clamp: 1;
+}
+
+.calendar-week .calendar-task-project {
+  font-size: 8px;
+  line-height: 1.2;
+}
+
+.calendar-week .calendar-task-copy {
+  gap: 0;
+  padding-right: 46px;
+}
+
+.calendar-week .calendar-task-grip {
+  flex: none;
+  width: 9px;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 8px;
+  line-height: 1;
+  letter-spacing: -1px;
+  cursor: ns-resize;
+  opacity: 0.55;
+}
+
+.calendar-week .calendar-task:hover .calendar-task-grip {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.calendar-task-order .calendar-task-order-remove {
+  border-color: transparent;
+  background: transparent;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.calendar-task-order .calendar-task-order-remove:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.calendar-task.is-order-target {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.calendar-week .calendar-task-remove {
+  top: 2px;
+  right: auto;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  z-index: 3;
+}
+
+.calendar-week .calendar-task-order {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 4;
+  display: flex;
+  gap: 1px;
+  opacity: 0.45;
+  transition: opacity 0.12s ease;
+}
+
+.calendar-week .calendar-task:hover .calendar-task-order,
+.calendar-week .calendar-task:focus-within .calendar-task-order {
+  opacity: 1;
+}
+
+.calendar-task-order button {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.calendar-task-order button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.calendar-task-order button:disabled {
+  opacity: 0.25;
+}
+
+.calendar-week .calendar-task-resize {
+  right: 1px;
+  bottom: 1px;
+  z-index: 3;
+}
+
+.calendar-week .calendar-task.is-span-end .calendar-task-resize,
+.calendar-week .calendar-task.is-span .calendar-task-resize {
+  opacity: 0.4;
+}
+
+.calendar-week .calendar-task:hover .calendar-task-resize {
+  opacity: 1;
+}
+
+.calendar-week .calendar-task.is-inbox-task {
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 8px;
+  border-radius: 8px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Быстрая синхронизация в боковой панели                              */
+/* ------------------------------------------------------------------ */
+.sidebar-sync {
+  flex: none;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.sync-version-card {
+  display: block;
+  width: 100%;
+  padding: 8px 9px 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  text-align: left;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.sync-version-card:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.sync-version-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.sync-version-label {
+  color: var(--faint);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sync-version-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.sync-version-dot.is-online {
+  background: var(--done);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--done) 18%, transparent);
+}
+
+.sync-version-dot.is-warning {
+  background: var(--accent);
+}
+
+.sync-version-number {
+  display: block;
+  margin-top: 3px;
+  color: var(--text);
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.sync-version-meta {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-version-meta.is-warning {
+  color: var(--accent-ink);
+}
+
+.quick-sync-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.quick-sync-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  padding: 5px 5px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 9.5px;
+  font-weight: 600;
+  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.quick-sync-btn .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.quick-sync-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.quick-sync-btn.is-primary {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.quick-sync-btn.is-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+}
+
+.quick-sync-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .sidebar-sync {
+    display: none;
   }
 }

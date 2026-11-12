@@ -40,12 +40,12 @@ export function startBrowserLifecycle() {
     }
     const url = `/api/session/close?session_id=${encodeURIComponent(sessionId)}`;
     try {
-      if (navigator.sendBeacon && navigator.sendBeacon(url)) return;
-    } catch (error) {
-      /* fallback ниже */
-    }
-    try {
-      fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+      fetch(url, {
+        method: "POST",
+        keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }).catch(() => {});
     } catch (error) {
       /* ignore */
     }

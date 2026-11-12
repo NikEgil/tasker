@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -44,7 +45,13 @@ def check(condition: bool, message: str) -> None:
 def start_server(port: int) -> None:
     global proc, current_port
     current_port = port
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    config_dir = TMP_DIR / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(
+        os.environ,
+        PYTHONIOENCODING="utf-8",
+        TASKER_CONFIG_DIR=str(config_dir),
+    )
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -283,6 +290,98 @@ def main() -> None:
         )
         call("DELETE", f"/api/tasks/{data['task']['id']}")
 
+        print("\n[2.2] Задача на несколько дней")
+        status, data = call(
+            "POST",
+            f"/api/projects/{project_id}/tasks",
+            {
+                "title": "Долгий проект",
+                "status": "urgent",
+                "scheduled_date": "2026-11-10",
+                "scheduled_end_date": "2026-11-13",
+            },
+        )
+        range_task = data["task"]
+        check(
+            status == 201 and range_task["scheduled_end_date"] == "2026-11-13",
+            "задача создаётся с датой окончания",
+        )
+        status, data = call("GET", "/api/calendar?start=2026-11-12&end=2026-11-12")
+        check(
+            status == 200
+            and any(task["id"] == range_task["id"] for task in data["scheduled"]),
+            "задача видна в середине диапазона",
+        )
+        status, data = call(
+            "PATCH", f"/api/tasks/{range_task['id']}", {"scheduled_end_date": "2026-11-15"}
+        )
+        check(
+            status == 200 and data["task"]["scheduled_end_date"] == "2026-11-15",
+            "дата окончания растягивается",
+        )
+        status, data = call(
+            "PATCH", f"/api/tasks/{range_task['id']}", {"scheduled_date": "2026-11-12"}
+        )
+        check(
+            status == 200 and data["task"]["scheduled_end_date"] == "2026-11-17",
+            "при переносе начала длительность сохраняется",
+        )
+        status, _ = call(
+            "PATCH",
+            f"/api/tasks/{range_task['id']}",
+            {"scheduled_date": "2026-11-20", "scheduled_end_date": "2026-11-18"},
+        )
+        check(status == 400, "окончание раньше начала отклоняется")
+        status, data = call(
+            "POST",
+            f"/api/projects/{project_id}/tasks",
+            {"title": "Вторая полоса", "scheduled_date": "2026-11-15"},
+        )
+        second_range_task = data["task"]
+        status, _ = call(
+            "POST",
+            "/api/calendar/order",
+            {"ids": [range_task["id"], second_range_task["id"]]},
+        )
+        check(status == 200, "порядок задач в календаре сохраняется")
+        status, data = call(
+            "GET", "/api/calendar?start=2026-11-01&end=2026-11-30"
+        )
+        ordered = {task["id"]: task.get("calendar_order") for task in data["scheduled"]}
+        check(
+            ordered.get(range_task["id"]) == 0
+            and ordered.get(second_range_task["id"]) == 1,
+            "календарный порядок записан в задачи",
+        )
+        call("DELETE", f"/api/tasks/{second_range_task['id']}")
+        call("DELETE", f"/api/tasks/{range_task['id']}")
+
+        status, data = call(
+            "POST",
+            "/api/sync/folder",
+            {"folder": "", "device_name": "Test PC", "mode": "yandex"},
+        )
+        check(
+            status == 200 and data["sync"]["mode"] == "yandex",
+            "режим Яндекс Диска сохраняется",
+        )
+        check(
+            "yandex" in data["sync"] and data["sync"]["yandex"]["connected"] is False,
+            "статус Яндекс Диска отдаётся без токена",
+        )
+        status, data = call("GET", "/api/sync/status?refresh=1")
+        check(
+            status == 200 and data["mode"] == "yandex" and data.get("remote") is None,
+            "быстрый статус Яндекс Диска не требует токена",
+        )
+        status, _ = call("POST", "/api/yandex/disconnect", {})
+        check(status == 200, "Яндекс Диск отключается")
+        call(
+            "POST",
+            "/api/sync/folder",
+            {"folder": "", "device_name": "Test PC", "mode": "folder"},
+        )
+
         print("\n[3] Заметки и вложения")
         body, content_type = multipart_body(
             {"text": "Заметка с фотографией и файлом"},
@@ -352,17 +451,36 @@ def main() -> None:
 
         print("\n[5] Резервные копии")
         status, data = call("POST", "/api/backup")
-        check(status == 201 and Path(data["path"]).is_file(), "резервная копия создаётся")
+        check(
+            status == 201
+            and data["filename"].endswith(".zip")
+            and Path(data["path"]).is_file(),
+            "резервная копия создаётся",
+        )
         backup_path = Path(data["path"])
-        with sqlite3.connect(backup_path) as conn:
+        with zipfile.ZipFile(backup_path) as archive:
+            names = archive.namelist()
+            check("tasker.db" in names, "в архиве есть база")
+            check(
+                any(name.startswith("tasker_files/") for name in names),
+                "в архиве есть папка файлов",
+            )
+            snapshot_bytes = archive.read("tasker.db")
+        snapshot_path = TMP_DIR / "backup-snapshot.db"
+        snapshot_path.write_bytes(snapshot_bytes)
+        with sqlite3.connect(snapshot_path) as conn:
             count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         check(count == 3, "в копии есть задачи")
 
         status, snapshot = call("GET", "/api/backup/download")
-        check(status == 200 and snapshot[:16] == b"SQLite format 3\x00", "скачивается файл SQLite")
-        snapshot_path = TMP_DIR / "snapshot.db"
+        check(status == 200 and snapshot[:2] == b"PK", "скачивается ZIP-архив")
+        snapshot_path = TMP_DIR / "downloaded-snapshot.zip"
         snapshot_path.write_bytes(snapshot)
-        with sqlite3.connect(snapshot_path) as conn:
+        with zipfile.ZipFile(snapshot_path) as archive:
+            db_bytes = archive.read("tasker.db")
+        db_path = TMP_DIR / "downloaded-snapshot.db"
+        db_path.write_bytes(db_bytes)
+        with sqlite3.connect(db_path) as conn:
             count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         check(count == 5, "в скачанной копии есть заметки")
 

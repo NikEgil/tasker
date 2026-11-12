@@ -84,6 +84,30 @@
       <nav class="project-list" id="project-list" aria-label="Список проектов"></nav>
       <p class="sidebar-empty" id="project-empty" hidden>Пока нет проектов.<br>Создайте первый — и добавьте задачи.</p>
 
+      <div class="sidebar-sync" aria-label="Быстрая синхронизация">
+        <button class="sync-version-card" id="sync-version-card" type="button"
+                title="Открыть настройки синхронизации">
+          <span class="sync-version-head">
+            <span class="sync-version-label">Актуальная версия</span>
+            <span class="sync-version-dot" id="sync-version-dot"></span>
+          </span>
+          <span class="sync-version-number" id="sync-version-number">—</span>
+          <span class="sync-version-meta" id="sync-version-meta">Синхронизация не настроена</span>
+        </button>
+        <div class="quick-sync-actions">
+          <button class="quick-sync-btn" id="quick-sync-pull" type="button"
+                  title="Скачать актуальную версию с Диска" disabled>
+            <svg class="icon"><use href="#i-download"></use></svg>
+            <span>Скачать</span>
+          </button>
+          <button class="quick-sync-btn is-primary" id="quick-sync-push" type="button"
+                  title="Отправить данные на Диск" disabled>
+            <svg class="icon"><use href="#i-send"></use></svg>
+            <span>На Диск</span>
+          </button>
+        </div>
+      </div>
+
       <div class="sidebar-foot">
         <button class="db-pill" id="settings-pill" type="button" title="Настройки" aria-label="Настройки">
           <span class="db-pill-icon"><svg class="icon"><use href="#i-settings"></use></svg></span>

@@ -1,10 +1,86 @@
-"""Системный диалог выбора файла базы (Windows, без внешних зависимостей)."""
+"""Системные диалоги выбора файла и папки (Windows, без внешних зависимостей)."""
 
 from __future__ import annotations
 
 import ctypes
 import os
 from pathlib import Path
+
+
+def choose_directory(initial_path: str | os.PathLike[str] | None = None) -> str | None:
+    """Открыть системный диалог выбора папки."""
+    if os.name != "nt":
+        raise OSError("Системный диалог выбора папки доступен только в Windows")
+
+    from ctypes import wintypes
+
+    class BROWSEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", wintypes.LPVOID),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", wintypes.LPVOID),
+            ("lParam", wintypes.LPARAM),
+            ("iImage", ctypes.c_int),
+        ]
+
+    BIF_RETURNONLYFSDIRS = 0x00000001
+    BIF_EDITBOX = 0x00000010
+    BIF_NEWDIALOGSTYLE = 0x00000040
+    BIF_USENEWUI = BIF_NEWDIALOGSTYLE | BIF_EDITBOX
+
+    display = ctypes.create_unicode_buffer(260)
+    title = "Папка Google Диска для Tasker"
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    owner = user32.GetForegroundWindow()
+    if not owner:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetConsoleWindow.restype = wintypes.HWND
+        owner = kernel32.GetConsoleWindow()
+
+    browse = BROWSEINFOW()
+    browse.hwndOwner = owner
+    browse.pszDisplayName = ctypes.cast(display, wintypes.LPWSTR)
+    browse.lpszTitle = title
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI
+
+    ole32 = ctypes.windll.ole32
+    com_initialized = False
+    try:
+        result = ole32.CoInitialize(None)
+        com_initialized = result in (0, 1)
+    except OSError:
+        pass
+
+    pidl = None
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFOW)]
+        shell32.SHBrowseForFolderW.restype = wintypes.LPVOID
+        shell32.SHGetPathFromIDListW.argtypes = [wintypes.LPVOID, wintypes.LPWSTR]
+        shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+        pidl = shell32.SHBrowseForFolderW(ctypes.byref(browse))
+        if not pidl:
+            return None
+        path_buffer = ctypes.create_unicode_buffer(4096)
+        if not shell32.SHGetPathFromIDListW(pidl, path_buffer):
+            return None
+        return path_buffer.value.strip() or None
+    finally:
+        if pidl:
+            try:
+                ole32.CoTaskMemFree.argtypes = [wintypes.LPVOID]
+                ole32.CoTaskMemFree(pidl)
+            except OSError:
+                pass
+        if com_initialized:
+            try:
+                ole32.CoUninitialize()
+            except OSError:
+                pass
 
 
 def choose_database_path(initial_path: str | os.PathLike[str] | None = None) -> str | None:
